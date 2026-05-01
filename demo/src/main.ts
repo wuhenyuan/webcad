@@ -1,10 +1,9 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import * as opentype from 'opentype.js';
 import {
-  init, createCylinderShape, releaseShapeHandle,
-  getFaceInfo, evalFaceUV, occMakeCylinder,
+  init, createCylinderShape, getFaceInfo, evalFaceUV, occMakeCylinder,
   SURFACE_TYPE_NAMES,
-  OccFaceInfoData, OccUVPointData,
 } from 'webcad-sdk';
 
 // ============================================================
@@ -14,7 +13,7 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x1a1a2e);
 
 const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
-camera.position.set(3, 1.5, 6);
+camera.position.set(3.5, 0.5, 5.5);
 camera.lookAt(0, 0, 0);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -23,234 +22,308 @@ renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 document.body.appendChild(renderer.domElement);
 
 const controls = new OrbitControls(camera, renderer.domElement);
-controls.enableDamping = true;
-controls.dampingFactor = 0.08;
+controls.enableDamping = true; controls.dampingFactor = 0.08;
 
-scene.add(new THREE.AmbientLight(0x555555));
+scene.add(new THREE.AmbientLight(0x666666));
 const d1 = new THREE.DirectionalLight(0xffffff, 1.0); d1.position.set(5, 8, 5); scene.add(d1);
 const d2 = new THREE.DirectionalLight(0x8888ff, 0.4); d2.position.set(-3, 2, -5); scene.add(d2);
 
 // ============================================================
-// UV rectangle state — the movable rectangle in parameter space
+// Text parameters
 // ============================================================
-// Cylinder lateral face: u ∈ [0, 2π], v ∈ [-h/2, h/2]
-//   u = angle around axis (0 to 2π, ~6.283)
-//   v = height along axis
-// The rectangle [uMin,uMax] × [vMin,vMax] defines a curved patch
-// on the cylinder surface.
-
-interface UVRect {
-  uMin: number; uMax: number;
-  vMin: number; vMax: number;
-}
-
-const uvRect: UVRect = { uMin: 0.8, uMax: 3.0, vMin: -0.5, vMax: 0.7 };
-
-// Sampling density
-const EDGE_SAMPLES = 60;   // points per edge
-const GRID_U = 10;         // interior grid divisions in u
-const GRID_V = 6;          // interior grid divisions in v
+const state = {
+  text: 'CAD',
+  offsetU: 0.8,
+  offsetV: 0.0,
+  uvScale: 2.5,
+  letterSpacing: 0.0,
+};
 
 // ============================================================
-// Dynamic objects (updated when UV rect changes)
+// Bezier flattening — de Casteljau subdivision
 // ============================================================
-const dynGroup = new THREE.Group();
-scene.add(dynGroup);
+// Convert cubic Bezier to polyline points.
+// Subdivides until chord error < tolerance.
+function flattenCubic(
+  x0: number, y0: number,
+  x1: number, y1: number,
+  x2: number, y2: number,
+  x3: number, y3: number,
+  tol: number,
+  out: number[][],
+) {
+  // Midpoint of the chord from start→end
+  const mcx = (x0 + x3) * 0.5, mcy = (y0 + y3) * 0.5;
+  // Midpoint of the curve at t=0.5
+  const bpx = (x0 + 3 * x1 + 3 * x2 + x3) * 0.125;
+  const bpy = (y0 + 3 * y1 + 3 * y2 + y3) * 0.125;
+  const dist = Math.hypot(bpx - mcx, bpy - mcy);
 
-// ============================================================
-// Sample UV rectangle → 3D points + normals
-// ============================================================
-interface Sample3D {
-  x: number; y: number; z: number;
-  nx: number; ny: number; nz: number;
-}
-
-function sampleUV(handle: number, faceIndex: number, u: number, v: number): Sample3D {
-  const p = evalFaceUV(handle, faceIndex, u, v);
-  return { x: p.x, y: p.y, z: p.z, nx: p.nx, ny: p.ny, nz: p.nz };
-}
-
-// Sample the 4 edges of the UV rectangle
-// Returns [bottomEdge, topEdge, leftEdge, rightEdge] as arrays of 3D samples
-function sampleEdges(
-  handle: number, faceIndex: number, r: UVRect, n: number,
-): [Sample3D[], Sample3D[], Sample3D[], Sample3D[]] {
-  const bottom: Sample3D[] = []; // v=vMin,  uMin→uMax
-  const top:    Sample3D[] = []; // v=vMax,  uMin→uMax
-  const left:   Sample3D[] = []; // u=uMin,  vMin→vMax
-  const right:  Sample3D[] = []; // u=uMax,  vMin→vMax
-
-  for (let i = 0; i <= n; i++) {
-    const t = i / n;
-    const u = r.uMin + (r.uMax - r.uMin) * t;
-    bottom.push(sampleUV(handle, faceIndex, u, r.vMin));
-    top.push(sampleUV(handle, faceIndex, u, r.vMax));
-    const v = r.vMin + (r.vMax - r.vMin) * t;
-    left.push(sampleUV(handle, faceIndex, r.uMin, v));
-    right.push(sampleUV(handle, faceIndex, r.uMax, v));
+  if (dist < tol) {
+    out.push([x3, y3]);
+    return;
   }
-  return [bottom, top, left, right];
+
+  // de Casteljau subdivision at t=0.5
+  const x01 = (x0 + x1) * 0.5,   y01 = (y0 + y1) * 0.5;
+  const x12 = (x1 + x2) * 0.5,   y12 = (y1 + y2) * 0.5;
+  const x23 = (x2 + x3) * 0.5,   y23 = (y2 + y3) * 0.5;
+  const x012 = (x01 + x12) * 0.5, y012 = (y01 + y12) * 0.5;
+  const x123 = (x12 + x23) * 0.5, y123 = (y12 + y23) * 0.5;
+  const x0123 = (x012 + x123) * 0.5, y0123 = (y012 + y123) * 0.5;
+
+  flattenCubic(x0, y0, x01, y01, x012, y012, x0123, y0123, tol, out);
+  flattenCubic(x0123, y0123, x123, y123, x23, y23, x3, y3, tol, out);
 }
 
-// Sample interior grid
-function sampleGrid(handle: number, faceIndex: number, r: UVRect, nu: number, nv: number): Sample3D[] {
-  const pts: Sample3D[] = [];
-  for (let j = 0; j <= nv; j++) {
-    const v = r.vMin + (r.vMax - r.vMin) * (j / nv);
-    for (let i = 0; i <= nu; i++) {
-      const u = r.uMin + (r.uMax - r.uMin) * (i / nu);
-      pts.push(sampleUV(handle, faceIndex, u, v));
+function flattenQuad(
+  x0: number, y0: number,
+  x1: number, y1: number,
+  x2: number, y2: number,
+  tol: number,
+  out: number[][],
+) {
+  const mcx = (x0 + x2) * 0.5, mcy = (y0 + y2) * 0.5;
+  const bpx = (x0 + 2 * x1 + x2) * 0.25;
+  const bpy = (y0 + 2 * y1 + y2) * 0.25;
+  const dist = Math.hypot(bpx - mcx, bpy - mcy);
+
+  if (dist < tol) {
+    out.push([x2, y2]);
+    return;
+  }
+
+  const x01 = (x0 + x1) * 0.5, y01 = (y0 + y1) * 0.5;
+  const x12 = (x1 + x2) * 0.5, y12 = (y1 + y2) * 0.5;
+  const x012 = (x01 + x12) * 0.5, y012 = (y01 + y12) * 0.5;
+
+  flattenQuad(x0, y0, x01, y01, x012, y012, tol, out);
+  flattenQuad(x012, y012, x12, y12, x2, y2, tol, out);
+}
+
+// ============================================================
+// Glyph → flattened polylines
+// ============================================================
+// Each glyph path can have multiple contours (e.g. 'O' has outer + inner ring).
+// Each contour is returned as a separate array of [x,y] points.
+function glyphToPolylines(
+  glyph: opentype.Glyph,
+  x: number, y: number,
+  fontSize: number,
+): number[][][] {
+  const path = glyph.getPath(x, y, fontSize);
+  const contours: number[][][] = [];
+  let current: number[][] = [];
+  let cx = 0, cy = 0;
+
+  for (const cmd of path.commands) {
+    switch (cmd.type) {
+      case 'M':
+        if (current.length > 0) contours.push(current);
+        current = [[cmd.x, cmd.y]];
+        cx = cmd.x; cy = cmd.y;
+        break;
+      case 'L':
+        current.push([cmd.x, cmd.y]);
+        cx = cmd.x; cy = cmd.y;
+        break;
+      case 'Q':
+        flattenQuad(cx, cy, cmd.x1, cmd.y1, cmd.x, cmd.y, 0.3, current);
+        cx = cmd.x; cy = cmd.y;
+        break;
+      case 'C':
+        flattenCubic(cx, cy, cmd.x1, cmd.y1, cmd.x2, cmd.y2, cmd.x, cmd.y, 0.3, current);
+        cx = cmd.x; cy = cmd.y;
+        break;
+      case 'Z':
+        // close: line back to first point of this contour
+        if (current.length > 0) {
+          const first = current[0];
+          current.push([first[0], first[1]]);
+        }
+        break;
     }
   }
-  return pts;
+  if (current.length > 0) contours.push(current);
+  return contours;
 }
 
 // ============================================================
-// Build/rebuild the UV rectangle visualization
+// Text → 3D polyline groups (all glyphs, all contours)
 // ============================================================
-function rebuildVisuals(handle: number, faceIndex: number, r: UVRect) {
-  // Clear previous
-  while (dynGroup.children.length > 0) dynGroup.remove(dynGroup.children[0]);
+interface Glyph3DContour {
+  positions: Float32Array; // [x0,y0,z0, x1,y1,z1, ...]
+  vertexCount: number;
+}
 
-  const [bottom, top, left, right] = sampleEdges(handle, faceIndex, r, EDGE_SAMPLES);
-  const grid = sampleGrid(handle, faceIndex, r, GRID_U, GRID_V);
+function buildText3D(
+  font: opentype.Font,
+  handle: number,
+  faceIndex: number,
+): Glyph3DContour[] {
+  const results: Glyph3DContour[] = [];
+  const fontSize = 72;
+  const uStart = state.offsetU;
 
-  // ---- Wireframe: 4 edges of the mapped rectangle ----
-  function makeLine(pts: Sample3D[], color: number) {
-    const positions: number[] = [];
-    for (let i = 0; i < pts.length - 1; i++) {
-      positions.push(pts[i].x, pts[i].y, pts[i].z, pts[i + 1].x, pts[i + 1].y, pts[i + 1].z);
+  // Layout: accumulate x as we process glyphs
+  let cursorX = 0;
+
+  for (const ch of state.text) {
+    const glyph = font.charToGlyph(ch);
+    if (!glyph || !glyph.path) continue;
+
+    // Flatten this glyph's beziers at the current cursor position
+    const contours = glyphToPolylines(glyph, cursorX, 0, fontSize);
+
+    // Map each contour to 3D
+    for (const contour of contours) {
+      if (contour.length < 2) continue;
+      const pts: number[] = [];
+      for (const [gx, gy] of contour) {
+        // gx,gy are in glyph coordinate space (scaled by fontSize)
+        // Map to UV: x → u, y → v
+        // v is negated because font y-up → CAD v-up
+        const u = uStart + (gx / fontSize) * state.uvScale;
+        const v = state.offsetV + (gy / fontSize) * state.uvScale;
+
+        const p = evalFaceUV(handle, faceIndex, u, v);
+        pts.push(p.x, p.y, p.z);
+      }
+      results.push({
+        positions: new Float32Array(pts),
+        vertexCount: pts.length / 3,
+      });
     }
+
+    // Advance cursor by glyph advance width + letter spacing
+    const adv = (glyph.advanceWidth ?? 0) / (font.unitsPerEm || 1000) * fontSize;
+    cursorX += adv + state.letterSpacing;
+  }
+
+  return results;
+}
+
+// ============================================================
+// Dynamic overlay
+// ============================================================
+const dyn = new THREE.Group();
+scene.add(dyn);
+
+let font: opentype.Font | null = null;
+
+function rebuildAll(handle: number, fi: number) {
+  while (dyn.children.length > 0) dyn.remove(dyn.children[0]);
+  if (!font) return;
+
+  const glyphs3D = buildText3D(font, handle, fi);
+
+  console.log(`\n=== "${state.text}" on cylinder ===`);
+  console.log(`  offsetU=${state.offsetU.toFixed(2)} offsetV=${state.offsetV.toFixed(2)} uvScale=${state.uvScale.toFixed(2)} letterSpacing=${state.letterSpacing.toFixed(2)}`);
+  console.log(`  contours: ${glyphs3D.length}`);
+
+  // Render each contour as a colored polyline
+  let contourIdx = 0;
+  for (const g of glyphs3D) {
     const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positions), 3));
-    return new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ color, linewidth: 2 }));
-  }
-  dynGroup.add(makeLine(bottom, 0xffeb3b)); // yellow: bottom
-  dynGroup.add(makeLine(top,    0xffeb3b)); // yellow: top
-  dynGroup.add(makeLine(left,   0xff9800)); // orange: left
-  dynGroup.add(makeLine(right,  0xff9800)); // orange: right
+    geo.setAttribute('position', new THREE.BufferAttribute(g.positions, 3));
 
-  // ---- Interior grid lines ----
-  const allPts = [bottom, top, ...grid]; // use all for normals below
+    // Alternate colors: cyan for outer contours, magenta for inner (holes)
+    const isHole = contourIdx % 2 === 1;
+    const color = isHole ? 0xff6e40 : 0x00e5ff;
 
-  // ---- Sample points: small spheres at grid intersections ----
-  const sphereGeo = new THREE.SphereGeometry(0.025, 8, 6);
-  for (const pt of grid) {
-    const sphere = new THREE.Mesh(
-      sphereGeo,
-      new THREE.MeshBasicMaterial({ color: 0x00e5ff }),
-    );
-    sphere.position.set(pt.x, pt.y, pt.z);
-    dynGroup.add(sphere);
-  }
+    dyn.add(new THREE.Line(
+      geo,
+      new THREE.LineBasicMaterial({ color, linewidth: 2 }),
+    ));
 
-  // ---- Normals: short lines from each grid point in normal direction ----
-  const normalLen = 0.15;
-  const normalPositions: number[] = [];
-  for (const pt of grid) {
-    normalPositions.push(
-      pt.x, pt.y, pt.z,
-      pt.x + pt.nx * normalLen,
-      pt.y + pt.ny * normalLen,
-      pt.z + pt.nz * normalLen,
-    );
-  }
-  const normalGeo = new THREE.BufferGeometry();
-  normalGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(normalPositions), 3));
-  dynGroup.add(new THREE.LineSegments(
-    normalGeo,
-    new THREE.LineBasicMaterial({ color: 0xff1744, linewidth: 1 }),
-  ));
+    // Sample points as small dots at polyline vertices
+    const dotGeo = new THREE.BufferGeometry();
+    dotGeo.setAttribute('position', new THREE.BufferAttribute(g.positions.slice(), 3));
+    dyn.add(new THREE.Points(
+      dotGeo,
+      new THREE.PointsMaterial({ color, size: 0.02 }),
+    ));
 
-  // ---- Log UV→XYZ correspondence ----
-  console.log(`\n=== UV Rect: u=[${r.uMin.toFixed(3)}, ${r.uMax.toFixed(3)}] v=[${r.vMin.toFixed(3)}, ${r.vMax.toFixed(3)}] ===`);
-  const corners = [
-    ['uMin,vMin', r.uMin, r.vMin],
-    ['uMax,vMin', r.uMax, r.vMin],
-    ['uMin,vMax', r.uMin, r.vMax],
-    ['uMax,vMax', r.uMax, r.vMax],
-  ];
-  for (const [label, u, v] of corners) {
-    const pt = sampleUV(handle, faceIndex, u, v);
-    console.log(`  ${label}: uv=(${u.toFixed(3)},${v.toFixed(3)}) → xyz=(${pt.x.toFixed(3)},${pt.y.toFixed(3)},${pt.z.toFixed(3)})  n=(${pt.nx.toFixed(3)},${pt.ny.toFixed(3)},${pt.nz.toFixed(3)})`);
+    console.log(`  contour[${contourIdx}]: ${g.vertexCount} vertices, color=${isHole ? 'hole' : 'outer'}`);
+    contourIdx++;
   }
 }
 
 // ============================================================
 // Control panel
 // ============================================================
-function createPanel(r: UVRect, onChange: () => void) {
+function createPanel(onChange: () => void) {
   const div = document.createElement('div');
   div.style.cssText = `
-    position: fixed; top: 16px; right: 16px;
-    background: rgba(10,10,20,0.88); color: #ccc;
-    padding: 16px 18px; border-radius: 8px;
-    font: 13px monospace; z-index: 100;
-    min-width: 240px;
+    position:fixed; top:16px; right:16px;
+    background:rgba(10,10,20,0.88); color:#ccc;
+    padding:16px 18px; border-radius:8px;
+    font:13px monospace; z-index:100; min-width:250px;
   `;
 
   const title = document.createElement('div');
-  title.textContent = 'UV Rectangle Controls';
+  title.textContent = 'Text On Surface';
   title.style.cssText = 'color:#fff; font-weight:bold; margin-bottom:12px; font-size:14px;';
   div.appendChild(title);
 
-  function addSlider(label: string, key: keyof UVRect, min: number, max: number, step: number) {
+  // Text input
+  const textRow = document.createElement('div');
+  textRow.style.cssText = 'margin-bottom:12px;';
+  const textLbl = document.createElement('span'); textLbl.textContent = 'text: '; textLbl.style.cssText = 'color:#aaa;';
+  const textInp = document.createElement('input');
+  textInp.type = 'text'; textInp.value = state.text;
+  textInp.style.cssText = 'width:100%; margin-top:4px; padding:4px 8px; font:14px monospace; background:#222; color:#fff; border:1px solid #555; border-radius:3px; outline:none; box-sizing:border-box;';
+  textInp.addEventListener('input', () => { state.text = textInp.value || 'CAD'; onChange(); });
+  textRow.appendChild(textLbl); textRow.appendChild(textInp);
+  div.appendChild(textRow);
+
+  // Sliders
+  function slider(label: string, key: keyof typeof state, min: number, max: number, step: number) {
     const row = document.createElement('div');
     row.style.cssText = 'margin-bottom:10px;';
-
-    const lbl = document.createElement('span');
-    lbl.textContent = label + ': ';
-    lbl.style.cssText = 'color:#aaa;';
-    row.appendChild(lbl);
-
-    const val = document.createElement('span');
-    val.textContent = r[key].toFixed(3);
-    val.style.cssText = 'color:#00e5ff; float:right;';
-    row.appendChild(val);
-
-    const slider = document.createElement('input');
-    slider.type = 'range';
-    slider.min = String(min);
-    slider.max = String(max);
-    slider.step = String(step);
-    slider.value = String(r[key]);
-    slider.style.cssText = 'width:100%; margin-top:4px; cursor:pointer;';
-    slider.addEventListener('input', () => {
-      (r as any)[key] = parseFloat(slider.value);
-      val.textContent = (r as any)[key].toFixed(3);
+    const hdr = document.createElement('div');
+    hdr.style.cssText = 'display:flex; justify-content:space-between;';
+    const lbl = document.createElement('span'); lbl.textContent = label; lbl.style.cssText = 'color:#aaa;';
+    const val = document.createElement('span'); val.textContent = (state[key] as number).toFixed(2); val.style.cssText = 'color:#00e5ff;';
+    hdr.appendChild(lbl); hdr.appendChild(val);
+    row.appendChild(hdr);
+    const inp = document.createElement('input');
+    inp.type = 'range'; inp.min = String(min); inp.max = String(max); inp.step = String(step);
+    inp.value = String(state[key]);
+    inp.style.cssText = 'width:100%; margin-top:2px; cursor:pointer;';
+    inp.addEventListener('input', () => {
+      (state as any)[key] = parseFloat(inp.value);
+      val.textContent = (state as any)[key].toFixed(2);
       onChange();
     });
-    row.appendChild(slider);
+    row.appendChild(inp);
     div.appendChild(row);
   }
 
-  addSlider('uMin', 'uMin', 0, 6.28, 0.05);
-  addSlider('uMax', 'uMax', 0, 6.28, 0.05);
-  addSlider('vMin', 'vMin', -1.1, 1.1, 0.05);
-  addSlider('vMax', 'vMax', -1.1, 1.1, 0.05);
+  slider('offsetU',      'offsetU',      0.1,  6.18, 0.02);
+  slider('offsetV',      'offsetV',     -0.9,  0.9,  0.02);
+  slider('uvScale',      'uvScale',      0.5,  5.0,  0.05);
+  slider('letterSpacing','letterSpacing',-10,  40,   0.5);
 
   // Presets
   const presets = document.createElement('div');
   presets.style.cssText = 'margin-top:10px; display:flex; flex-wrap:wrap; gap:4px;';
-
-  function presetBtn(label: string, uMin: number, uMax: number, vMin: number, vMax: number) {
-    const btn = document.createElement('button');
-    btn.textContent = label;
-    btn.style.cssText = 'padding:3px 8px; font:11px monospace; cursor:pointer; background:#333; color:#ccc; border:1px solid #555; border-radius:3px;';
-    btn.addEventListener('click', () => {
-      r.uMin = uMin; r.uMax = uMax; r.vMin = vMin; r.vMax = vMax;
-      // Reset sliders — just rebuild the whole panel
-      div.remove();
-      createPanel(r, onChange);
-      onChange();
+  function btn(label: string, t: string, ou: number, ov: number, s: number, ls: number) {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.style.cssText = 'padding:3px 8px; font:11px monospace; cursor:pointer; background:#333; color:#ccc; border:1px solid #555; border-radius:3px;';
+    b.addEventListener('click', () => {
+      state.text = t; state.offsetU = ou; state.offsetV = ov;
+      state.uvScale = s; state.letterSpacing = ls;
+      textInp.value = t;
+      div.remove(); createPanel(onChange); onChange();
     });
-    return btn;
+    return b;
   }
-
-  presets.appendChild(presetBtn('small patch', 1.5, 2.5, -0.3, 0.3));
-  presets.appendChild(presetBtn('half wrap', 0, 3.14, -0.5, 0.5));
-  presets.appendChild(presetBtn('full band', 0, 6.28, -0.3, 0.3));
-  presets.appendChild(presetBtn('tall strip', 1.0, 2.0, -0.9, 0.9));
+  presets.appendChild(btn('"CAD"',    'CAD',    0.8,  0.0,  2.5,  0));
+  presets.appendChild(btn('"HELLO"',  'HELLO',  0.3,  0.0,  3.5,  2));
+  presets.appendChild(btn('"你好"',   '你好',   1.5,  0.0,  2.0,  5));
+  presets.appendChild(btn('"曲线"',   '曲线',   0.5, -0.2,  2.5,  8));
   div.appendChild(presets);
 
   document.body.appendChild(div);
@@ -258,22 +331,20 @@ function createPanel(r: UVRect, onChange: () => void) {
 }
 
 // ============================================================
-// Help panel
+// Help overlay
 // ============================================================
 function addHelp() {
   const div = document.createElement('div');
   div.style.cssText = `
-    position: fixed; bottom: 16px; left: 16px;
-    background: rgba(0,0,0,0.7); color: #999;
-    padding: 10px 14px; border-radius: 6px;
-    font: 11px monospace; line-height: 1.6;
-    pointer-events: none; z-index: 10;
+    position:fixed; bottom:16px; left:16px;
+    background:rgba(0,0,0,0.7); color:#888;
+    padding:10px 14px; border-radius:6px;
+    font:11px monospace; line-height:1.7; pointer-events:none; z-index:10;
   `;
   div.innerHTML = `
-    <span style="color:#ffeb3b">━━</span> u-edges (top/bottom)
-    <span style="color:#ff9800">━━</span> v-edges (left/right)<br>
-    <span style="color:#00e5ff">●</span> sample points
-    <span style="color:#ff1744">╵</span> surface normals
+    <span style="color:#00e5ff">━━</span> outer contour &nbsp;
+    <span style="color:#ff6e40">━━</span> inner (hole)<br>
+    opentype.js → bezier flatten → UV→XYZ
   `;
   document.body.appendChild(div);
 }
@@ -282,62 +353,59 @@ function addHelp() {
 // Main
 // ============================================================
 async function main() {
-  console.time('WASM init');
+  console.time('init');
   await init();
-  console.timeEnd('WASM init');
+  console.timeEnd('init');
 
   console.log('╔══════════════════════════════════════╗');
-  console.log('║  Curve On Surface Verification      ║');
-  console.log('║  UV Rectangle → Cylinder Surface    ║');
+  console.log('║  Surface Text Curve                 ║');
+  console.log('║  opentype.js → bezier → UV→3D       ║');
   console.log('╚══════════════════════════════════════╝');
   console.log('');
-  console.log('A rectangle in UV space [uMin,uMax]×[vMin,vMax] is sampled');
-  console.log('along its boundary and interior. Each (u,v) is converted to');
-  console.log('a 3D point via Geom_Surface::D1(u,v).');
-  console.log('');
-  console.log('Cylinder parametrization:');
-  console.log('  u = angle around Z axis  [0, 2π]');
-  console.log('  v = position along Z axis [-h/2, h/2]');
-  console.log('  P(u,v) = (R·cos(u), R·sin(u), v)');
-  console.log('  Normal = (cos(u), sin(u), 0)');
+  console.log('Pipeline:');
+  console.log('  1. opentype.js parses .ttf font');
+  console.log('  2. glyph.getPath() → (M,L,Q,C,Z) commands');
+  console.log('  3. de Casteljau flattening → polyline');
+  console.log('  4. glyph (x,y) → UV coordinate');
+  console.log('  5. Geom_Surface::D1(u,v) → 3D point');
   console.log('');
 
-  // Create cylinder via topology API
+  // Load font: simhei.ttf (Windows 黑体, 9MB — cached after first load)
+  // Supports Latin + CJK. Swap the path to use any .ttf/.otf font.
+  console.time('load font');
+  const fontResp = await fetch('/simhei.ttf');
+  if (!fontResp.ok) throw new Error(`Font fetch failed: ${fontResp.status} ${fontResp.statusText}`);
+  const fontBuf = await fontResp.arrayBuffer();
+  font = opentype.parse(fontBuf);
+  console.timeEnd('load font');
+  const familyName = font.names?.fontFamily?.en ?? (font.names?.fontFamily as any)?.['zh-Hans'] ?? 'SimHei';
+  console.log(`Font: ${familyName}, unitsPerEm=${font.unitsPerEm}, glyphs=${font.glyphs.length}\n`);
+
+  // Create cylinder
   const cylHandle = createCylinderShape(1.0, 2.2);
-  const faceInfo = getFaceInfo(cylHandle, 0);
-  console.log(`Lateral face: type=${SURFACE_TYPE_NAMES[faceInfo.surfaceType]}(${faceInfo.surfaceType})`);
-  console.log(`  UV bounds: u=[${faceInfo.uMin.toFixed(3)}, ${faceInfo.uMax.toFixed(3)}] v=[${faceInfo.vMin.toFixed(3)}, ${faceInfo.vMax.toFixed(3)}]`);
+  const fi = getFaceInfo(cylHandle, 0);
+  console.log(`Cylinder lateral face: ${SURFACE_TYPE_NAMES[fi.surfaceType]}`);
+  console.log(`  UV domain: u=[${fi.uMin.toFixed(3)},${fi.uMax.toFixed(3)}] v=[${fi.vMin.toFixed(3)},${fi.vMax.toFixed(3)}]\n`);
 
-  // ---- Background: semi-transparent cylinder mesh ----
-  const cylMeshData = occMakeCylinder(1.0, 2.2, 0.06);
+  // Background cylinder
+  const cylData = occMakeCylinder(1.0, 2.2, 0.06);
   const cylGeo = new THREE.BufferGeometry();
-  cylGeo.setAttribute('position', new THREE.BufferAttribute(cylMeshData.positions, 3));
-  cylGeo.setAttribute('normal', new THREE.BufferAttribute(cylMeshData.normals, 3));
-  cylGeo.setIndex(new THREE.BufferAttribute(cylMeshData.indices, 1));
-  const cylMat = new THREE.MeshStandardMaterial({
-    color: 0x4488aa, roughness: 0.4, metalness: 0.1,
-    side: THREE.DoubleSide, transparent: true, opacity: 0.35,
-  });
-  const cylMesh = new THREE.Mesh(cylGeo, cylMat);
-  scene.add(cylMesh);
+  cylGeo.setAttribute('position', new THREE.BufferAttribute(cylData.positions, 3));
+  cylGeo.setAttribute('normal', new THREE.BufferAttribute(cylData.normals, 3));
+  cylGeo.setIndex(new THREE.BufferAttribute(cylData.indices, 1));
+  scene.add(new THREE.Mesh(cylGeo, new THREE.MeshStandardMaterial({
+    color: 0x334455, roughness: 0.5, metalness: 0.1,
+    side: THREE.DoubleSide, transparent: true, opacity: 0.3,
+  })));
 
-  // Wireframe overlay on cylinder
-  const wireGeo = new THREE.WireframeGeometry(cylGeo);
-  scene.add(new THREE.LineSegments(
-    wireGeo,
-    new THREE.LineBasicMaterial({ color: 0x334455, opacity: 0.25, transparent: true }),
-  ));
-
-  // ---- UV Rectangle visualization ----
-  const onChange = () => rebuildVisuals(cylHandle, 0, uvRect);
-  createPanel(uvRect, onChange);
+  // UI
+  const onChange = () => rebuildAll(cylHandle, 0);
+  createPanel(onChange);
   addHelp();
-  onChange(); // initial build
+  onChange();
 
-  console.log('\nUse the sliders (top-right) to move/resize the UV rectangle.');
-  console.log('Watch the 3D wireframe update in real time.\n');
+  console.log('Type text, drag sliders → text appears on cylinder surface.\n');
 
-  // Render loop
   function animate() {
     requestAnimationFrame(animate);
     controls.update();
