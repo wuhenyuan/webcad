@@ -220,3 +220,95 @@ export function shapeDebugPrint(shape: ShapeData): void {
 export function faceDebugPrint(shape: ShapeData, faceIndex: number): void {
   _m.faceDebugPrint(shape._handle, faceIndex);
 }
+
+// ============================================================
+// Phase 4: OCCT Topology Exploration
+// ============================================================
+// These functions let you inspect the internal structure of an OCCT shape:
+//   - List all Faces (bounded surface patches)
+//   - Get the underlying Geom_Surface for each Face
+//   - Get UV parameter bounds (the "trimmed surface" rectangle)
+//   - Evaluate the surface at any (u,v) → 3D point + normal
+//   - Tessellate a single Face independently
+
+export interface OccFaceInfoData {
+  surfaceType: number; // GeomAbs_SurfaceType enum
+  uMin: number; uMax: number;
+  vMin: number; vMax: number;
+}
+
+export interface OccUVPointData {
+  x: number; y: number; z: number;
+  nx: number; ny: number; nz: number;
+}
+
+// Shape handle system — create a shape, get back an int handle to use with other functions
+export function occCreateBoxShape(dx: number, dy: number, dz: number): number {
+  if (!_m) throw new Error('Not initialized.');
+  return _m.occCreateBoxShape(dx, dy, dz);
+}
+
+export function createCylinderShape(radius: number, height: number): number {
+  if (!_m) throw new Error('Not initialized.');
+  return _m.occCreateCylinderShape(radius, height);
+}
+
+export function createSphereShape(radius: number): number {
+  if (!_m) throw new Error('Not initialized.');
+  return _m.occCreateSphereShape(radius);
+}
+
+export function createConeShape(r1: number, r2: number, height: number): number {
+  if (!_m) throw new Error('Not initialized.');
+  return _m.occCreateConeShape(r1, r2, height);
+}
+
+export function releaseShapeHandle(handle: number): void {
+  if (!_m) throw new Error('Not initialized.');
+  _m.occReleaseShapeHandle(handle);
+}
+
+// Topology traversal
+export function occShapeFaceCount(handle: number): number {
+  return _m.occShapeFaceCount(handle);
+}
+
+export function getFaceInfo(handle: number, faceIndex: number): OccFaceInfoData {
+  const info = _m.occGetFaceInfo(handle, faceIndex);
+  return {
+    surfaceType: info.surfaceType,
+    uMin: info.uMin, uMax: info.uMax,
+    vMin: info.vMin, vMax: info.vMax,
+  };
+}
+
+// Evaluate surface at UV coordinates
+export function evalFaceUV(handle: number, faceIndex: number, u: number, v: number): OccUVPointData {
+  const pt = _m.occEvalFaceUV(handle, faceIndex, u, v);
+  return { x: pt.x, y: pt.y, z: pt.z, nx: pt.nx, ny: pt.ny, nz: pt.nz };
+}
+
+// Tessellate a single face (for per-face highlighting)
+export function tessellateFaceMesh(handle: number, faceIndex: number, deflection: number): OccMeshData {
+  const raw = _m.occTessellateFaceMesh(handle, faceIndex, deflection);
+  return {
+    positions: vecToFloat32(raw.positions),
+    normals:   vecToFloat32(raw.normals),
+    indices:   vecToUint32(raw.indices),
+  };
+}
+
+// Human-readable surface type names
+export const SURFACE_TYPE_NAMES: Record<number, string> = {
+  0: 'Plane',
+  1: 'Cylinder',
+  2: 'Cone',
+  3: 'Sphere',
+  4: 'Torus',
+  5: 'Bezier',
+  6: 'BSpline',
+  7: 'Revolution',
+  8: 'Extrusion',
+  9: 'Offset',
+  10: 'Other',
+};

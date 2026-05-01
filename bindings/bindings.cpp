@@ -112,3 +112,32 @@ EMSCRIPTEN_BINDINGS(OccGeometryBindings) {
     function("occMakeCylinder", &occMakeCylinder_2);
     function("occMakeCylinder", &occMakeCylinder_3);
 }
+
+// ---- Phase 4: Topology exploration bindings ----
+
+EMSCRIPTEN_BINDINGS(TopologyExplorationBindings) {
+    value_object<OccFaceInfo>("OccFaceInfo")
+        .field("surfaceType", &OccFaceInfo::surfaceType)
+        .field("uMin", &OccFaceInfo::uMin)
+        .field("uMax", &OccFaceInfo::uMax)
+        .field("vMin", &OccFaceInfo::vMin)
+        .field("vMax", &OccFaceInfo::vMax);
+
+    value_object<OccUVPoint>("OccUVPoint")
+        .field("x",  &OccUVPoint::x)
+        .field("y",  &OccUVPoint::y)
+        .field("z",  &OccUVPoint::z)
+        .field("nx", &OccUVPoint::nx)
+        .field("ny", &OccUVPoint::ny)
+        .field("nz", &OccUVPoint::nz);
+
+    function("occCreateBoxShape",      &occCreateBoxShape);
+    function("occCreateCylinderShape", &occCreateCylinderShape);
+    function("occCreateSphereShape",   &occCreateSphereShape);
+    function("occCreateConeShape",     &occCreateConeShape);
+    function("occReleaseShapeHandle",  &occReleaseShapeHandle);
+    function("occShapeFaceCount",      &occShapeFaceCount);
+    function("occGetFaceInfo",         &occGetFaceInfo);
+    function("occEvalFaceUV",          &occEvalFaceUV);
+    function("occTessellateFaceMesh",  &occTessellateFaceMesh);
+}
