@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(where emcc *)",
+      "Bash(emcc --version)",
+      "Bash(git clone *)",
+      "Bash(./emsdk install *)",
+      "Bash(./emsdk activate *)",
+      "Bash(./emsdk list *)",
+      "Bash(python ./emsdk.py install latest)",
+      "Bash(python ./emsdk.py activate latest)",
+      "Bash(export EMSDK=\"$HOME/emsdk\")",
+      "Bash(export EMSCRIPTEN=\"$EMSDK/upstream/emscripten\")",
+      "Bash(export PATH=\"$EMSDK:$EMSDK/upstream/emscripten:$EMSDK/node/22.16.0_64bit/bin:$EMSDK/python/3.13.3_64bit:$PATH\")",
+      "Bash(export EMSDK_NODE=\"$EMSDK/node/22.16.0_64bit/bin/node.exe\")",
+      "Bash(export EMSDK_PYTHON=\"$EMSDK/python/3.13.3_64bit/python.exe\")",
+      "Read(//c/Program Files/CMake/bin/**)",
+      "Read(//c/Program Files \\(x86\\)/CMake/bin/**)",
+      "Bash(export PATH=\"$EMSDK:$EMSDK/upstream/emscripten:$EMSDK/node/22.16.0_64bit/bin:$PATH\")",
+      "Bash(python __TRACKED_VAR__/upstream/emscripten/emcc.py bindings.cpp ../core/geometry.cpp -o geometry_module.js --bind -s WASM=1 -s ALLOW_MEMORY_GROWTH=1 -s MODULARIZE=1 -s EXPORT_NAME=GeometryModule -s ENVIRONMENT=web,worker -I../core -O2)",
+      "Bash(npm install *)",
+      "Bash(export PATH=\"$EMSDK/node/22.16.0_64bit/bin:$PATH\")",
+      "Bash(rm -rf node_modules package-lock.json)",
+      "Bash(npx vite *)",
+      "Bash(curl -s http://localhost:5173/)",
+      "Bash(curl -s http://localhost:5173/geometry_module.js)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:5173/geometry_module.wasm)",
+      "Bash(curl -s http://localhost:5173/src/main.ts)",
+      "Bash(curl -s \"http://localhost:5173/@fs/D:/code/webcad/web-sdk/src/index.ts\")",
+      "Bash(pkill -f \"vite\")",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:5173/)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:5173/geometry_module.js)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:5173/src/main.ts)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" \"http://localhost:5173/@fs/D:/code/webcad/web-sdk/src/index.ts\")",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" \"http://localhost:5173/node_modules/.vite/deps/three.js?v=f196bc19\")"
+    ]
+  }
+}
