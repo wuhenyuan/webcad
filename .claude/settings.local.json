@@ -32,7 +32,20 @@
       "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:5173/geometry_module.js)",
       "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:5173/src/main.ts)",
       "Bash(curl -s -o /dev/null -w \"%{http_code}\" \"http://localhost:5173/@fs/D:/code/webcad/web-sdk/src/index.ts\")",
-      "Bash(curl -s -o /dev/null -w \"%{http_code}\" \"http://localhost:5173/node_modules/.vite/deps/three.js?v=f196bc19\")"
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" \"http://localhost:5173/node_modules/.vite/deps/three.js?v=f196bc19\")",
+      "Bash(bash build_wasm.sh)",
+      "Bash(cmd.exe /c __TRACKED_VAR__/emsdk/upstream/emscripten/emcc.bat bindings.cpp ../core/geometry.cpp -o geometry_module.js --bind -s WASM=1 -s ALLOW_MEMORY_GROWTH=1 -s MODULARIZE=1 -s EXPORT_NAME=GeometryModule -s ENVIRONMENT=web,worker -I../core -O2)",
+      "Bash(cmd.exe /c \"where node\")",
+      "Bash(export PATH=\"/c/Program Files/nodejs:$PATH\")",
+      "WebFetch(domain:localhost)",
+      "Bash(npx tsc *)",
+      "Bash(curl -s http://localhost:5176/)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:5176/geometry_module.js)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:5176/geometry_module.wasm)",
+      "Bash(node *)",
+      "Bash(curl -s http://localhost:5176/src/main.ts)",
+      "Bash(curl -s \"http://localhost:5176/@fs/D:/code/webcad/web-sdk/src/index.ts\")",
+      "Skill(update-config)"
     ]
   }
 }

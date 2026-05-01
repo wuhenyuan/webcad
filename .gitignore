@@ -1,1 +1,7 @@
 node_modules/
+occt_build/
+bindings/occt/
+bindings/geometry_module.js
+bindings/geometry_module.wasm
+demo/public/geometry_module.js
+demo/public/geometry_module.wasm
