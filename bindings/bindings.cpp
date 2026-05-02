@@ -141,3 +141,17 @@ EMSCRIPTEN_BINDINGS(TopologyExplorationBindings) {
     function("occEvalFaceUV",          &occEvalFaceUV);
     function("occTessellateFaceMesh",  &occTessellateFaceMesh);
 }
+
+// ---- Phase 5: Wire topology bindings ----
+
+EMSCRIPTEN_BINDINGS(WireTopologyBindings) {
+    value_object<OccWireInfo>("OccWireInfo")
+        .field("edgeCount",   &OccWireInfo::edgeCount)
+        .field("isClosed",    &OccWireInfo::isClosed)
+        .field("totalLength", &OccWireInfo::totalLength);
+
+    function("occMakeWireFromPoints", &occMakeWireFromPoints);
+    function("occGetWireInfo",        &occGetWireInfo);
+    function("occSampleWire3D",       &occSampleWire3D);
+    function("occReleaseWireHandle",  &occReleaseWireHandle);
+}

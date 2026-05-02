@@ -1,6 +1,7 @@
 #pragma once
 #include <vector>
 #include <cstdint>
+#include <emscripten/val.h>
 
 // ============================================================
 // OCCT-backed geometry — Phase 3
@@ -77,3 +78,39 @@ OccUVPoint   occEvalFaceUV(int handle, int faceIndex, double u, double v);
 
 // Tessellate a single face (for per-face highlighting)
 OccMesh      occTessellateFaceMesh(int handle, int faceIndex, double deflection);
+
+// ============================================================
+// Wire topology — Phase 5
+// ============================================================
+//
+// A TopoDS_Wire is a connected sequence of TopoDS_Edge objects.
+// Wires are the building blocks for trimmed surfaces:
+//   Surface + outer Wire = Trimmed Face
+//   Surface + outer Wire + inner Wires (holes) = Trimmed Face with holes
+//
+// Pipeline:
+//   1. Sample glyph outline → 3D polyline on surface
+//   2. Create TopoDS_Edge for each polyline segment
+//   3. Connect edges into TopoDS_Wire (shared vertices)
+//   4. Verify closure (first vertex ≈ last vertex)
+
+struct OccWireInfo {
+    int edgeCount;
+    bool isClosed;
+    double totalLength;
+};
+
+// Create a wire from 3D polyline points that lie on a surface.
+// pts3D: JS Float64Array — flat [x0,y0,z0, x1,y1,z1, ...] (n*3 doubles)
+// closeWire: if true, add closing edge from last point back to first
+// Returns wire handle (int), or -1 on failure.
+int  occMakeWireFromPoints(emscripten::val pts3D, bool closeWire);
+
+// Inspect wire
+OccWireInfo occGetWireInfo(int wireHandle);
+
+// Sample wire edges at uniform intervals → flat [x,y,z,...] for Three.js
+emscripten::val occSampleWire3D(int wireHandle, int samplesPerEdge);
+
+// Cleanup
+void occReleaseWireHandle(int wireHandle);

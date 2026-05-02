@@ -40,6 +40,14 @@
 #include <Geom_Surface.hxx>
 #include <GeomAdaptor_Surface.hxx>
 #include <BRepTools.hxx>
+#include <BRepBuilderAPI_MakeEdge.hxx>
+#include <BRepBuilderAPI_MakeWire.hxx>
+#include <BRepBuilderAPI_MakeVertex.hxx>
+#include <TopExp.hxx>
+#include <TopoDS_Wire.hxx>
+#include <TopoDS_Edge.hxx>
+#include <TopoDS_Vertex.hxx>
+#include <BRepAdaptor_Curve.hxx>
 
 #include <cmath>
 #include <cstdio>
@@ -432,4 +440,185 @@ OccMesh occTessellateFaceMesh(int handle, int faceIndex, double deflection) {
 
     printf("  [occ] tessellateFaceMesh(handle=%d, face=%d, defl=%.3g)\n", handle, faceIndex, deflection);
     return extractSingleFaceMesh(shape, faceIndex);
+}
+
+// ============================================================
+// Wire topology — Phase 5
+// ============================================================
+//
+// Global wire registry (same pattern as shape registry).
+// Each wire is a TopoDS_Wire: a connected sequence of edges.
+// For trimmed surfaces later, wires define the trimming boundary.
+
+static std::vector<TopoDS_Wire> g_wireRegistry;
+
+int occMakeWireFromPoints(emscripten::val pts3D, bool closeWire) {
+    int n = pts3D["length"].as<int>();
+    if (n < 6) {
+        printf("  [occ] makeWire: need at least 2 points (6 floats), got %d\n", n);
+        return -1;
+    }
+    int nPts = n / 3;
+
+    // Extract 3D points from JS array
+    std::vector<gp_Pnt> points(nPts);
+    for (int i = 0; i < nPts; i++) {
+        points[i] = gp_Pnt(
+            pts3D[i * 3 + 0].as<double>(),
+            pts3D[i * 3 + 1].as<double>(),
+            pts3D[i * 3 + 2].as<double>()
+        );
+    }
+
+    // Skip duplicate consecutive points (can happen from bezier flattening)
+    std::vector<gp_Pnt> clean;
+    clean.push_back(points[0]);
+    for (int i = 1; i < nPts; i++) {
+        if (points[i].Distance(clean.back()) > 1e-9)
+            clean.push_back(points[i]);
+    }
+    int nClean = static_cast<int>(clean.size());
+    if (nClean < 2) {
+        printf("  [occ] makeWire: after dedup, only %d points\n", nClean);
+        return -1;
+    }
+
+    BRepBuilderAPI_MakeWire wireBuilder;
+    TopoDS_Vertex lastV;
+
+    // Build edges from deduplicated points
+    for (int i = 0; i < nClean - 1; i++) {
+        TopoDS_Vertex v1, v2;
+        if (i == 0) {
+            v1 = BRepBuilderAPI_MakeVertex(clean[i]);
+        } else {
+            v1 = lastV; // share vertex with previous edge
+        }
+        v2 = BRepBuilderAPI_MakeVertex(clean[i + 1]);
+        TopoDS_Edge edge = BRepBuilderAPI_MakeEdge(v1, v2);
+        wireBuilder.Add(edge);
+        lastV = v2;
+    }
+
+    // Close if requested
+    if (closeWire && nClean > 2) {
+        double gap = clean.back().Distance(clean[0]);
+        if (gap > 1e-7) {
+            TopoDS_Vertex firstV = BRepBuilderAPI_MakeVertex(clean[0]);
+            wireBuilder.Add(BRepBuilderAPI_MakeEdge(lastV, firstV));
+            printf("  [occ] makeWire: added closing edge, gap=%.4g\n", gap);
+        }
+    }
+
+    wireBuilder.Build();
+    if (!wireBuilder.IsDone()) {
+        printf("  [occ] makeWire: Build failed!\n");
+        return -1;
+    }
+
+    TopoDS_Wire wire = wireBuilder.Wire();
+    int handle = static_cast<int>(g_wireRegistry.size());
+    g_wireRegistry.push_back(wire);
+
+    // Verify closure by checking first/last vertex distance
+    double gap = clean.back().Distance(clean[0]);
+    printf("  [occ] makeWire: handle=%d pts=%d→%d closed=%s gap=%.4g\n",
+           handle, nPts, nClean, gap < 1e-6 ? "yes" : "no", gap);
+    return handle;
+}
+
+OccWireInfo occGetWireInfo(int wireHandle) {
+    OccWireInfo info = {};
+    if (wireHandle < 0 || wireHandle >= static_cast<int>(g_wireRegistry.size()))
+        return info;
+
+    const TopoDS_Wire& wire = g_wireRegistry[wireHandle];
+
+    // Count edges by exploring the wire
+    int edgeCount = 0;
+    TopExp_Explorer ex;
+    for (ex.Init(wire, TopAbs_EDGE); ex.More(); ex.Next()) {
+        edgeCount++;
+    }
+    info.edgeCount = edgeCount;
+
+    // Closure check: explore edges and compare first/last point
+    if (edgeCount > 0) {
+        ex.Init(wire, TopAbs_EDGE);
+        TopoDS_Vertex v0, vN;
+        if (ex.More()) {
+            const TopoDS_Edge& e0 = TopoDS::Edge(ex.Current());
+            // Get two endpoints of first edge from BRepAdaptor
+            BRepAdaptor_Curve c0(e0);
+            gp_Pnt pFirst = c0.Value(c0.FirstParameter());
+            v0 = BRepBuilderAPI_MakeVertex(pFirst);
+        }
+        // Walk to last edge
+        TopoDS_Edge eLast;
+        for (ex.Init(wire, TopAbs_EDGE); ex.More(); ex.Next()) {
+            eLast = TopoDS::Edge(ex.Current());
+        }
+        BRepAdaptor_Curve cLast(eLast);
+        gp_Pnt pLast = cLast.Value(cLast.LastParameter());
+        vN = BRepBuilderAPI_MakeVertex(pLast);
+
+        double gap = BRep_Tool::Pnt(v0).Distance(BRep_Tool::Pnt(vN));
+        info.isClosed = (gap < 1e-6);
+
+        // Compute total length: sum of edge point distances
+        double totalLen = 0;
+        for (ex.Init(wire, TopAbs_EDGE); ex.More(); ex.Next()) {
+            const TopoDS_Edge& e = TopoDS::Edge(ex.Current());
+            BRepAdaptor_Curve ac(e);
+            gp_Pnt pa = ac.Value(ac.FirstParameter());
+            gp_Pnt pb = ac.Value(ac.LastParameter());
+            totalLen += pa.Distance(pb);
+        }
+        info.totalLength = totalLen;
+    }
+
+    printf("  [occ] getWireInfo(handle=%d): edges=%d closed=%s len=%.3g\n",
+           wireHandle, info.edgeCount, info.isClosed ? "yes" : "no", info.totalLength);
+    return info;
+}
+
+emscripten::val occSampleWire3D(int wireHandle, int samplesPerEdge) {
+    using namespace emscripten;
+    if (wireHandle < 0 || wireHandle >= static_cast<int>(g_wireRegistry.size()))
+        return val::array();
+
+    const TopoDS_Wire& wire = g_wireRegistry[wireHandle];
+    if (samplesPerEdge < 2) samplesPerEdge = 2;
+
+    std::vector<float> positions;
+
+    TopExp_Explorer ex;
+    for (ex.Init(wire, TopAbs_EDGE); ex.More(); ex.Next()) {
+        const TopoDS_Edge& edge = TopoDS::Edge(ex.Current());
+        BRepAdaptor_Curve curve(edge);
+        double t0 = curve.FirstParameter();
+        double t1 = curve.LastParameter();
+        for (int i = 0; i < samplesPerEdge; i++) {
+            double t = t0 + (t1 - t0) * i / (samplesPerEdge - 1);
+            gp_Pnt p = curve.Value(t);
+            positions.push_back(static_cast<float>(p.X()));
+            positions.push_back(static_cast<float>(p.Y()));
+            positions.push_back(static_cast<float>(p.Z()));
+        }
+    }
+
+    val result = val::array();
+    for (size_t i = 0; i < positions.size(); i++) {
+        result.call<void>("push", positions[i]);
+    }
+    printf("  [occ] sampleWire3D(handle=%d, spp=%d): %d floats\n",
+           wireHandle, samplesPerEdge, static_cast<int>(positions.size()));
+    return result;
+}
+
+void occReleaseWireHandle(int wireHandle) {
+    if (wireHandle >= 0 && wireHandle < static_cast<int>(g_wireRegistry.size())) {
+        g_wireRegistry[wireHandle].Nullify();
+        printf("  [occ] released wire handle=%d\n", wireHandle);
+    }
 }

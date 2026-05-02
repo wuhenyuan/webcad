@@ -298,6 +298,40 @@ export function tessellateFaceMesh(handle: number, faceIndex: number, deflection
   };
 }
 
+// ============================================================
+// Phase 5: Wire topology
+// ============================================================
+export interface OccWireInfoData {
+  edgeCount: number;
+  isClosed: boolean;
+  totalLength: number;
+}
+
+// Create a TopoDS_Wire from 3D polyline points.
+// pts3D: Float64Array — flat [x0,y0,z0, x1,y1,z1, ...]
+export function makeWireFromPoints(pts3D: Float64Array, closeWire: boolean): number {
+  if (!_m) throw new Error('Not initialized.');
+  return _m.occMakeWireFromPoints(pts3D, closeWire);
+}
+
+export function getWireInfo(handle: number): OccWireInfoData {
+  return _m.occGetWireInfo(handle);
+}
+
+// Sample wire edges for 3D visualization → Float32Array
+// occSampleWire3D returns a plain JS Array (not emscripten vector), so we convert directly
+export function sampleWire3D(handle: number, samplesPerEdge: number): Float32Array {
+  const arr = _m.occSampleWire3D(handle, samplesPerEdge);
+  const n = arr.length;
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) out[i] = arr[i];
+  return out;
+}
+
+export function releaseWireHandle(handle: number): void {
+  _m.occReleaseWireHandle(handle);
+}
+
 // Human-readable surface type names
 export const SURFACE_TYPE_NAMES: Record<number, string> = {
   0: 'Plane',
