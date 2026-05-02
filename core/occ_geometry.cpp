@@ -48,6 +48,15 @@
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Vertex.hxx>
 #include <BRepAdaptor_Curve.hxx>
+#include <BRepBuilderAPI_MakeFace.hxx>
+#include <BRepPrimAPI_MakePrism.hxx>
+#include <BRepBuilderAPI_Sewing.hxx>
+#include <BRepBuilderAPI_MakeSolid.hxx>
+#include <TopoDS_Shell.hxx>
+#include <TopoDS_Solid.hxx>
+#include <gp_Pln.hxx>
+#include <gp_Cylinder.hxx>
+#include <Standard_Failure.hxx>
 
 #include <cmath>
 #include <cstdio>
@@ -620,5 +629,353 @@ void occReleaseWireHandle(int wireHandle) {
     if (wireHandle >= 0 && wireHandle < static_cast<int>(g_wireRegistry.size())) {
         g_wireRegistry[wireHandle].Nullify();
         printf("  [occ] released wire handle=%d\n", wireHandle);
+    }
+}
+
+// ============================================================
+// Face + Solid construction — Phase 6
+// ============================================================
+
+int occMakeFace(int outerWireHandle, emscripten::val innerWireHandles) {
+    if (outerWireHandle < 0 || outerWireHandle >= static_cast<int>(g_wireRegistry.size())) {
+        printf("  [occ] makeFace: invalid outerWireHandle=%d\n", outerWireHandle);
+        return -1;
+    }
+
+    const TopoDS_Wire& outerWire = g_wireRegistry[outerWireHandle];
+
+    // Create face on XY plane trimmed by outer wire
+    gp_Pln plane(gp::XOY());
+    BRepBuilderAPI_MakeFace faceBuilder(plane, outerWire);
+
+    // Add hole wires
+    int numHoles = innerWireHandles["length"].as<int>();
+    for (int i = 0; i < numHoles; i++) {
+        int holeHandle = innerWireHandles[i].as<int>();
+        if (holeHandle >= 0 && holeHandle < static_cast<int>(g_wireRegistry.size())) {
+            faceBuilder.Add(g_wireRegistry[holeHandle]);
+            printf("  [occ] makeFace: added hole wire[%d]\n", holeHandle);
+        }
+    }
+
+    faceBuilder.Build();
+    if (!faceBuilder.IsDone()) {
+        printf("  [occ] makeFace: Build failed!\n");
+        return -1;
+    }
+
+    TopoDS_Shape face = faceBuilder.Shape();
+    int handle = static_cast<int>(g_shapeRegistry.size());
+    g_shapeRegistry.push_back(face);
+
+    printf("  [occ] makeFace: handle=%d outerWire=%d holes=%d\n", handle, outerWireHandle, numHoles);
+    return handle;
+}
+
+int occMakePrism(int shapeHandle, double dx, double dy, double dz) {
+    if (shapeHandle < 0 || shapeHandle >= static_cast<int>(g_shapeRegistry.size())) {
+        printf("  [occ] makePrism: invalid shapeHandle=%d\n", shapeHandle);
+        return -1;
+    }
+
+    const TopoDS_Shape& shape = g_shapeRegistry[shapeHandle];
+    gp_Vec dir(dx, dy, dz);
+
+    BRepPrimAPI_MakePrism prism(shape, dir);
+    prism.Build();
+    if (!prism.IsDone()) {
+        printf("  [occ] makePrism: Build failed!\n");
+        return -1;
+    }
+
+    TopoDS_Shape solid = prism.Shape();
+    int handle = static_cast<int>(g_shapeRegistry.size());
+    g_shapeRegistry.push_back(solid);
+
+    printf("  [occ] makePrism: handle=%d from=%d dir=(%.2f,%.2f,%.2f)\n",
+           handle, shapeHandle, dx, dy, dz);
+    return handle;
+}
+
+OccMesh occTessellateShape(int shapeHandle, double deflection) {
+    OccMesh empty;
+    if (shapeHandle < 0 || shapeHandle >= static_cast<int>(g_shapeRegistry.size())) {
+        printf("  [occ] tessellateShape: invalid handle=%d\n", shapeHandle);
+        return empty;
+    }
+    const TopoDS_Shape& shape = g_shapeRegistry[shapeHandle];
+    printf("  [occ] tessellateShape(handle=%d, defl=%.3g)\n", shapeHandle, deflection);
+    return tessellateShape(shape, deflection);
+}
+
+OccTopologyInfo occGetTopologyInfo(int shapeHandle) {
+    OccTopologyInfo info = {};
+    if (shapeHandle < 0 || shapeHandle >= static_cast<int>(g_shapeRegistry.size())) {
+        printf("  [occ] getTopologyInfo: invalid handle=%d\n", shapeHandle);
+        return info;
+    }
+
+    const TopoDS_Shape& shape = g_shapeRegistry[shapeHandle];
+
+    TopExp_Explorer ex;
+    for (ex.Init(shape, TopAbs_SOLID); ex.More(); ex.Next()) info.numSolids++;
+    for (ex.Init(shape, TopAbs_SHELL, TopAbs_SOLID); ex.More(); ex.Next()) info.numShells++;
+    for (ex.Init(shape, TopAbs_FACE, TopAbs_SHELL); ex.More(); ex.Next()) info.numFaces++;
+    for (ex.Init(shape, TopAbs_WIRE, TopAbs_FACE); ex.More(); ex.Next()) info.numWires++;
+    for (ex.Init(shape, TopAbs_EDGE, TopAbs_WIRE); ex.More(); ex.Next()) info.numEdges++;
+    for (ex.Init(shape, TopAbs_VERTEX, TopAbs_EDGE); ex.More(); ex.Next()) info.numVertices++;
+
+    printf("  [occ] getTopologyInfo(handle=%d): S=%d Sh=%d F=%d W=%d E=%d V=%d\n",
+           shapeHandle, info.numSolids, info.numShells, info.numFaces,
+           info.numWires, info.numEdges, info.numVertices);
+    return info;
+}
+
+// ============================================================
+// Surface-aware emboss — Phase 7 (manual, no TKOffset)
+// ============================================================
+
+// Sample a wire into 3D points (internal helper)
+static void sampleWirePoints(const TopoDS_Wire& wire, int samplesPerEdge,
+                              std::vector<gp_Pnt>& outPts) {
+    TopExp_Explorer ex;
+    for (ex.Init(wire, TopAbs_EDGE); ex.More(); ex.Next()) {
+        const TopoDS_Edge& edge = TopoDS::Edge(ex.Current());
+        BRepAdaptor_Curve curve(edge);
+        double t0 = curve.FirstParameter();
+        double t1 = curve.LastParameter();
+        int n = (samplesPerEdge < 2) ? 2 : samplesPerEdge;
+        for (int i = 0; i < n - 1; i++) {  // skip last point to avoid duplicate with next edge
+            double t = t0 + (t1 - t0) * i / (n - 1);
+            outPts.push_back(curve.Value(t));
+        }
+    }
+    // Add the very last point (end of last edge)
+    if (!outPts.empty()) {
+        TopExp_Explorer ex2;
+        TopoDS_Edge lastEdge;
+        for (ex2.Init(wire, TopAbs_EDGE); ex2.More(); ex2.Next()) {
+            lastEdge = TopoDS::Edge(ex2.Current());
+        }
+        BRepAdaptor_Curve curve(lastEdge);
+        outPts.push_back(curve.Value(curve.LastParameter()));
+    }
+}
+
+// Offset points along Z-axis cylinder normals
+static std::vector<gp_Pnt> offsetAlongCylinderNormals(const std::vector<gp_Pnt>& pts,
+                                                       double radius, double offset) {
+    std::vector<gp_Pnt> result;
+    result.reserve(pts.size());
+    for (const auto& p : pts) {
+        // Z-axis cylinder normal: radial direction in XY plane
+        double r = std::sqrt(p.X() * p.X() + p.Y() * p.Y());
+        if (r < 1e-12) { result.push_back(p); continue; }
+        double nx = p.X() / r;
+        double ny = p.Y() / r;
+        result.push_back(gp_Pnt(p.X() + nx * offset, p.Y() + ny * offset, p.Z()));
+    }
+    return result;
+}
+
+// Create a triangular face from 3 points. Returns null face on failure.
+// Logs diagnostic info on first failure.
+static bool buildTriangleFace(const gp_Pnt& a, const gp_Pnt& b, const gp_Pnt& c,
+                               TopoDS_Face& outFace, bool verbose) {
+    // Pre-check: edge lengths
+    double lenAB = a.Distance(b);
+    double lenAC = a.Distance(c);
+    double lenBC = b.Distance(c);
+    if (lenAB < 1e-9 || lenAC < 1e-9 || lenBC < 1e-9) {
+        if (verbose) printf("  [occ] tri fail: degenerate edge AB=%.3g AC=%.3g BC=%.3g\n", lenAB, lenAC, lenBC);
+        return false;
+    }
+
+    // Pre-check: area via cross product
+    gp_Vec ab(a, b);
+    gp_Vec ac(a, c);
+    gp_Vec n = ab.Crossed(ac);
+    double area = n.Magnitude() * 0.5;
+    if (area < 1e-13) {
+        if (verbose) printf("  [occ] tri fail: near-zero area=%.3g\n", area);
+        return false;
+    }
+
+    try {
+        gp_Dir normal(n);  // may throw if mag < gp::Resolution()
+        gp_Pln plane(a, normal);
+
+        TopoDS_Vertex va = BRepBuilderAPI_MakeVertex(a);
+        TopoDS_Vertex vb = BRepBuilderAPI_MakeVertex(b);
+        TopoDS_Vertex vc = BRepBuilderAPI_MakeVertex(c);
+
+        TopoDS_Edge eab, ebc, eca;
+        try { eab = BRepBuilderAPI_MakeEdge(va, vb); } catch (...) {
+            if (verbose) printf("  [occ] tri fail: MakeEdge ab threw\n"); return false;
+        }
+        try { ebc = BRepBuilderAPI_MakeEdge(vb, vc); } catch (...) {
+            if (verbose) printf("  [occ] tri fail: MakeEdge bc threw\n"); return false;
+        }
+        try { eca = BRepBuilderAPI_MakeEdge(vc, va); } catch (...) {
+            if (verbose) printf("  [occ] tri fail: MakeEdge ca threw\n"); return false;
+        }
+
+        BRepBuilderAPI_MakeWire wb;
+        wb.Add(eab); wb.Add(ebc); wb.Add(eca);
+        wb.Build();
+        if (!wb.IsDone()) {
+            if (verbose) printf("  [occ] tri fail: wire not done\n");
+            return false;
+        }
+
+        BRepBuilderAPI_MakeFace fb(plane, wb.Wire());
+        fb.Build();
+        if (!fb.IsDone()) {
+            if (verbose) printf("  [occ] tri fail: face not done\n");
+            return false;
+        }
+
+        outFace = fb.Face();
+        return true;
+    } catch (const Standard_Failure& e) {
+        if (verbose) printf("  [occ] tri fail: %s\n", e.GetMessageString());
+        return false;
+    } catch (...) {
+        if (verbose) printf("  [occ] tri fail: unknown throw\n");
+        return false;
+    }
+}
+
+int occBuildEmboss(int wireHandle, double radius, double offset, int samplesPerEdge) {
+    if (wireHandle < 0 || wireHandle >= static_cast<int>(g_wireRegistry.size())) {
+        printf("  [occ] buildEmboss: invalid wireHandle=%d\n", wireHandle);
+        return -1;
+    }
+    if (samplesPerEdge < 2) samplesPerEdge = 2;
+
+    const char* step = "init";
+    try {
+    const TopoDS_Wire& bottomWire = g_wireRegistry[wireHandle];
+
+    step = "1 sample";
+    std::vector<gp_Pnt> bottomPts;
+    sampleWirePoints(bottomWire, samplesPerEdge, bottomPts);
+    int nPts = static_cast<int>(bottomPts.size());
+    printf("  [occ] buildEmboss: sampled %d points (samplesPerEdge=%d)\n", nPts, samplesPerEdge);
+    if (nPts < 3) { printf("  [occ] buildEmboss: too few points\n"); return -1; }
+
+    // De-dup bottom points BEFORE offset (keeps bottom/top in sync)
+    {
+        std::vector<gp_Pnt> dedup;
+        for (size_t i = 0; i < bottomPts.size(); i++) {
+            if (dedup.empty() || bottomPts[i].Distance(dedup.back()) > 1e-9)
+                dedup.push_back(bottomPts[i]);
+        }
+        if (dedup.size() >= 2 && dedup.back().Distance(dedup[0]) < 1e-7)
+            dedup.pop_back();
+        if (dedup.size() < 3) {
+            printf("  [occ] buildEmboss: too few points after de-dup (%d)\n", (int)dedup.size());
+            return -1;
+        }
+        bottomPts = std::move(dedup);
+        nPts = static_cast<int>(bottomPts.size());
+        printf("  [occ] buildEmboss: after de-dup: %d pts\n", nPts);
+    }
+
+    step = "2 offset";
+    std::vector<gp_Pnt> topPts = offsetAlongCylinderNormals(bottomPts, radius, offset);
+
+    step = "3 topWire";
+    BRepBuilderAPI_MakeWire topWireBuilder;
+    {
+        TopoDS_Vertex lastV;
+        for (int i = 0; i < nPts - 1; i++) {
+            TopoDS_Vertex v1 = (i == 0) ? BRepBuilderAPI_MakeVertex(topPts[i]) : lastV;
+            TopoDS_Vertex v2 = BRepBuilderAPI_MakeVertex(topPts[i + 1]);
+            topWireBuilder.Add(BRepBuilderAPI_MakeEdge(v1, v2));
+            lastV = v2;
+        }
+        double gap = topPts.back().Distance(topPts[0]);
+        if (gap > 1e-7) {
+            TopoDS_Vertex firstV = BRepBuilderAPI_MakeVertex(topPts[0]);
+            topWireBuilder.Add(BRepBuilderAPI_MakeEdge(lastV, firstV));
+        }
+        topWireBuilder.Build();
+    }
+    if (!topWireBuilder.IsDone()) { printf("  [occ] buildEmboss: topWire failed\n"); return -1; }
+    TopoDS_Wire topWire = topWireBuilder.Wire();
+    printf("  [occ] buildEmboss: topWire OK\n");
+
+    step = "4 bottomFace";
+    gp_Cylinder cylR(gp_Ax3(gp::Origin(), gp::DZ()), radius);
+    BRepBuilderAPI_MakeFace bfb(cylR, bottomWire);
+    bfb.Build();
+    if (!bfb.IsDone()) { printf("  [occ] buildEmboss: bottomFace failed\n"); return -1; }
+    TopoDS_Face bottomFace = bfb.Face();
+    printf("  [occ] buildEmboss: bottomFace OK\n");
+
+    step = "5 topFace";
+    gp_Cylinder cylRp(gp_Ax3(gp::Origin(), gp::DZ()), radius + offset);
+    BRepBuilderAPI_MakeFace tfb(cylRp, topWire);
+    tfb.Build();
+    if (!tfb.IsDone()) { printf("  [occ] buildEmboss: topFace failed\n"); return -1; }
+    TopoDS_Face topFace = tfb.Face();
+    printf("  [occ] buildEmboss: topFace OK\n");
+
+    step = "6 sideFaces";
+    BRepBuilderAPI_Sewing sewer(0.01);
+    sewer.Add(bottomFace);
+    sewer.Add(topFace);
+    int sideOk = 0, sideFail = 0;
+    int firstFailIdx = -1;
+    for (int i = 0; i < nPts; i++) {
+        int j = (i + 1) % nPts;
+        TopoDS_Face tri;
+        bool verbose = (sideFail == 0); // verbose only for first failure
+        if (buildTriangleFace(bottomPts[i], bottomPts[j], topPts[i], tri, verbose)) { sewer.Add(tri); sideOk++; }
+        else { if (firstFailIdx < 0) firstFailIdx = i; sideFail++; }
+        if (buildTriangleFace(bottomPts[j], topPts[j], topPts[i], tri, verbose)) { sewer.Add(tri); sideOk++; }
+        else { if (firstFailIdx < 0) firstFailIdx = i; sideFail++; }
+    }
+    if (firstFailIdx >= 0) {
+        int j = (firstFailIdx + 1) % nPts;
+        const auto& b0 = bottomPts[firstFailIdx], b1 = bottomPts[j];
+        const auto& t0 = topPts[firstFailIdx], t1 = topPts[j];
+        printf("  [occ] firstFail segment[%d]:\n", firstFailIdx);
+        printf("    b0=(%.4f,%.4f,%.4f) t0=(%.4f,%.4f,%.4f)\n", b0.X(),b0.Y(),b0.Z(), t0.X(),t0.Y(),t0.Z());
+        printf("    b1=(%.4f,%.4f,%.4f) t1=(%.4f,%.4f,%.4f)\n", b1.X(),b1.Y(),b1.Z(), t1.X(),t1.Y(),t1.Z());
+        printf("    len b0-b1=%.4g  t0-t1=%.4g  b0-t0=%.4g  b1-t1=%.4g\n",
+               b0.Distance(b1), t0.Distance(t1), b0.Distance(t0), b1.Distance(t1));
+    }
+    printf("  [occ] buildEmboss: side triangles ok=%d fail=%d, sewing %d faces...\n",
+           sideOk, sideFail, 2 + sideOk);
+
+    step = "7 sew";
+    sewer.Perform();
+    TopoDS_Shape sewed = sewer.SewedShape();
+    if (sewed.IsNull()) { printf("  [occ] buildEmboss: sew null\n"); return -1; }
+    TopoDS_Shell shell;
+    TopExp_Explorer shEx;
+    for (shEx.Init(sewed, TopAbs_SHELL); shEx.More(); shEx.Next()) { shell = TopoDS::Shell(shEx.Current()); break; }
+    if (shell.IsNull()) { printf("  [occ] buildEmboss: no shell\n"); return -1; }
+    printf("  [occ] buildEmboss: sew OK\n");
+
+    step = "8 solid";
+    BRepBuilderAPI_MakeSolid solidMaker(shell);
+    solidMaker.Build();
+    if (!solidMaker.IsDone()) { printf("  [occ] buildEmboss: solid failed\n"); return -1; }
+    TopoDS_Shape solid = solidMaker.Solid();
+
+    int handle = static_cast<int>(g_shapeRegistry.size());
+    g_shapeRegistry.push_back(solid);
+    printf("  [occ] buildEmboss: OK handle=%d R=%.2f offset=%.3f pts=%d\n", handle, radius, offset, nPts);
+    return handle;
+
+    } catch (const Standard_Failure& e) {
+        printf("  [occ] buildEmboss: Standard_Failure at [%s]: %s\n", step, e.GetMessageString());
+        return -1;
+    } catch (...) {
+        printf("  [occ] buildEmboss: unknown exception at [%s]\n", step);
+        return -1;
     }
 }

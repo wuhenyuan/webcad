@@ -22,7 +22,7 @@ echo "==> Compiling C++ to WASM..."
 OCCT_FLAGS=""
 if [ -d "$OCCT_LIB" ] && [ -f "$OCCT_LIB/libTKernel.a" ]; then
     echo "    OCCT libraries found at $OCCT_ROOT"
-    OCCT_FLAGS="-I$OCCT_INC -L$OCCT_LIB \
+    OCCT_FLAGS="-fexceptions -I$OCCT_INC -L$OCCT_LIB \
         -lTKMesh -lTKShHealing -lTKPrim -lTKTopAlgo \
         -lTKBRep -lTKGeomBase -lTKGeomAlgo \
         -lTKG3d -lTKG2d \

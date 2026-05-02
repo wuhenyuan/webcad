@@ -155,3 +155,30 @@ EMSCRIPTEN_BINDINGS(WireTopologyBindings) {
     function("occSampleWire3D",       &occSampleWire3D);
     function("occReleaseWireHandle",  &occReleaseWireHandle);
 }
+
+// ---- Phase 6: Face + Solid construction bindings ----
+
+static OccMesh occTessellateShape_2(int handle, double defl) {
+    return occTessellateShape(handle, defl);
+}
+
+EMSCRIPTEN_BINDINGS(FaceSolidBindings) {
+    value_object<OccTopologyInfo>("OccTopologyInfo")
+        .field("numSolids",  &OccTopologyInfo::numSolids)
+        .field("numShells",  &OccTopologyInfo::numShells)
+        .field("numFaces",   &OccTopologyInfo::numFaces)
+        .field("numWires",   &OccTopologyInfo::numWires)
+        .field("numEdges",   &OccTopologyInfo::numEdges)
+        .field("numVertices",&OccTopologyInfo::numVertices);
+
+    function("occMakeFace",          &occMakeFace);
+    function("occMakePrism",         &occMakePrism);
+    function("occTessellateShape",   &occTessellateShape_2);
+    function("occGetTopologyInfo",   &occGetTopologyInfo);
+}
+
+// ---- Phase 7: Surface-aware emboss bindings ----
+
+EMSCRIPTEN_BINDINGS(EmbossBindings) {
+    function("occBuildEmboss", &occBuildEmboss);
+}

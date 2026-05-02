@@ -346,3 +346,64 @@ export const SURFACE_TYPE_NAMES: Record<number, string> = {
   9: 'Offset',
   10: 'Other',
 };
+
+// ============================================================
+// Phase 6: Face + Solid construction
+// ============================================================
+export interface OccTopologyInfoData {
+  numSolids: number;
+  numShells: number;
+  numFaces: number;
+  numWires: number;
+  numEdges: number;
+  numVertices: number;
+}
+
+// Create a planar face on XY plane from outer wire + optional hole wires
+export function makeFace(outerWireHandle: number, innerWireHandles: number[]): number {
+  if (!_m) throw new Error('Not initialized.');
+  return _m.occMakeFace(outerWireHandle, innerWireHandles);
+}
+
+// Extrude a face/shape along a direction vector → solid
+export function makePrism(shapeHandle: number, dx: number, dy: number, dz: number): number {
+  if (!_m) throw new Error('Not initialized.');
+  return _m.occMakePrism(shapeHandle, dx, dy, dz);
+}
+
+// Tessellate any shape in the registry
+export function tessellateShape(handle: number, deflection: number): OccMeshData {
+  const raw = _m.occTessellateShape(handle, deflection);
+  return {
+    positions: vecToFloat32(raw.positions),
+    normals:   vecToFloat32(raw.normals),
+    indices:   vecToUint32(raw.indices),
+  };
+}
+
+// Get topology counts for debug
+export function getTopologyInfo(handle: number): OccTopologyInfoData {
+  const info = _m.occGetTopologyInfo(handle);
+  return {
+    numSolids: info.numSolids,
+    numShells: info.numShells,
+    numFaces: info.numFaces,
+    numWires: info.numWires,
+    numEdges: info.numEdges,
+    numVertices: info.numVertices,
+  };
+}
+
+// ============================================================
+// Phase 7: Surface-aware emboss (manual boundary sampling)
+// ============================================================
+
+// Build emboss solid from a glyph wire on a Z-axis cylinder.
+// wireHandle: glyph boundary wire (must lie on cylinder surface)
+// radius: cylinder radius
+// offset: emboss depth along surface normal (positive = outward)
+// samplesPerEdge: number of sample points per wire edge
+export function buildEmboss(wireHandle: number, radius: number, offset: number, samplesPerEdge: number): number {
+  if (!_m) throw new Error('Not initialized.');
+  return _m.occBuildEmboss(wireHandle, radius, offset, samplesPerEdge);
+}

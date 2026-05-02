@@ -114,3 +114,65 @@ emscripten::val occSampleWire3D(int wireHandle, int samplesPerEdge);
 
 // Cleanup
 void occReleaseWireHandle(int wireHandle);
+
+// ============================================================
+// Face + Solid construction — Phase 6
+// ============================================================
+//
+// Wire → Face → Solid pipeline:
+//   1. Glyph outline → 3D polyline on plane
+//   2. TopoDS_Wire (outer + inner holes)
+//   3. TopoDS_Face (planar surface trimmed by wires)
+//   4. BRepPrimAPI_MakePrism → extrusion solid
+//   5. Tessellate → Three.js mesh
+//
+// This phase works on plane surfaces only.
+
+struct OccTopologyInfo {
+    int numSolids;
+    int numShells;
+    int numFaces;
+    int numWires;
+    int numEdges;
+    int numVertices;
+};
+
+// Create a planar face on XY plane from outer wire + optional hole wires.
+// innerWireHandles: JS array of int (can be empty array for no holes)
+int  occMakeFace(int outerWireHandle, emscripten::val innerWireHandles);
+
+// Extrude a face/shape along a direction vector → solid.
+// shapeHandle: handle into g_shapeRegistry (must be a face or shell)
+// Returns new shape handle for the resulting solid.
+int  occMakePrism(int shapeHandle, double dx, double dy, double dz);
+
+// Tessellate any shape in the registry (face, solid, etc.)
+OccMesh occTessellateShape(int shapeHandle, double deflection);
+
+// Debug: count sub-shapes of each type
+OccTopologyInfo occGetTopologyInfo(int shapeHandle);
+
+// ============================================================
+// Surface-aware emboss — Phase 7
+// ============================================================
+//
+// Builds a closed solid by offsetting a wire on a cylinder surface
+// along surface normals. Uses boundary sampling + triangle side faces
+// + sewing — no external offset library needed.
+//
+// Pipeline:
+//   1. Sample bottom wire edges → 3D points on cylinder at radius
+//   2. Offset each point along cylinder normal → top points (radius + offset)
+//   3. Create top wire from offset points
+//   4. Create bottom face: BRepBuilderAPI_MakeFace(gp_Cylinder(R), bottomWire)
+//   5. Create top face:   BRepBuilderAPI_MakeFace(gp_Cylinder(R+offset), topWire)
+//   6. Create side triangle faces (bottom[i]→bottom[i+1]→top[i] + ...)
+//   7. BRepBuilderAPI_Sewing → shell
+//   8. BRepBuilderAPI_MakeSolid → closed solid
+
+// Build emboss solid from a glyph wire on a cylinder.
+// wireHandle: glyph boundary wire (must lie on cylinder surface at radius)
+// radius: cylinder radius
+// offset: emboss depth along surface normal (positive = outward)
+// samplesPerEdge: number of sample points per wire edge (>= 2)
+int  occBuildEmboss(int wireHandle, double radius, double offset, int samplesPerEdge);

@@ -45,7 +45,8 @@
       "Bash(node *)",
       "Bash(curl -s http://localhost:5176/src/main.ts)",
       "Bash(curl -s \"http://localhost:5176/@fs/D:/code/webcad/web-sdk/src/index.ts\")",
-      "Skill(update-config)"
+      "Skill(update-config)",
+      "mcp__ide__getDiagnostics"
     ]
   }
 }
