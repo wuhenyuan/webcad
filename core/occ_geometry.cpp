@@ -40,6 +40,7 @@
 #include <Geom_Surface.hxx>
 #include <GeomAdaptor_Surface.hxx>
 #include <BRepTools.hxx>
+#include <BRepBuilderAPI_Copy.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepBuilderAPI_MakeVertex.hxx>
@@ -84,10 +85,13 @@
 // ---- Internal: tessellate any TopoDS_Shape → OccMesh ----
 
 static OccMesh tessellateShape(const TopoDS_Shape& shape, double deflection) {
-    // Step 1: Run incremental mesher on the whole shape.
-    // This fills each Face with a Poly_Triangulation.
-    BRepMesh_IncrementalMesh mesher(shape, deflection);
-    // Constructor performs meshing; explicit Perform() is optional but safe.
+    // Step 1: Deep-copy then clean so we can force re-mesh at any deflection.
+    // BRepMesh_IncrementalMesh caches triangulation on the shape; without
+    // cleaning, deflection changes are ignored.
+    BRepBuilderAPI_Copy copier(shape);
+    TopoDS_Shape shapeCopy = copier.Shape();
+    BRepTools::Clean(shapeCopy);
+    BRepMesh_IncrementalMesh mesher(shapeCopy, deflection);
     mesher.Perform();
 
     OccMesh result;
@@ -96,7 +100,7 @@ static OccMesh tessellateShape(const TopoDS_Shape& shape, double deflection) {
 
     // Step 2: Count nodes & triangles first (so we can allocate once)
     TopExp_Explorer fc0;
-    for (fc0.Init(shape, TopAbs_FACE); fc0.More(); fc0.Next()) {
+    for (fc0.Init(shapeCopy, TopAbs_FACE); fc0.More(); fc0.Next()) {
         const TopoDS_Face& face = TopoDS::Face(fc0.Current());
         TopLoc_Location loc;
         Handle(Poly_Triangulation) tri = BRep_Tool::Triangulation(face, loc);
@@ -112,7 +116,7 @@ static OccMesh tessellateShape(const TopoDS_Shape& shape, double deflection) {
 
     // Step 3: Extract per-face mesh data
     TopExp_Explorer fc;
-    for (fc.Init(shape, TopAbs_FACE); fc.More(); fc.Next()) {
+    for (fc.Init(shapeCopy, TopAbs_FACE); fc.More(); fc.Next()) {
         const TopoDS_Face& face = TopoDS::Face(fc.Current());
         TopLoc_Location loc;
         Handle(Poly_Triangulation) tri = BRep_Tool::Triangulation(face, loc);

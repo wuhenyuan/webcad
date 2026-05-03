@@ -330,6 +330,7 @@ function createPanel(cylHandle: number, fi: number, font: opentype.Font, onChang
   slider('uvScale',       'uvScale',       0.5,  5.0,  0.05);
   slider('emboss depth',  'embossDepth',   0.02, 0.5,  0.005);
   slider('letterSpacing', 'letterSpacing',-10,   40,   0.5);
+  slider('solid thickness','solidThickness',0.01, 0.3, 0.005);
   slider('mesh deflection','deflection',   0.01, 0.3,  0.005);
 
   function btn(label: string, t: string, ou: number, ov: number, s: number, ed: number, ls: number) {
