@@ -214,7 +214,7 @@ function rebuildAll(cylHandle: number, fi: number, font: opentype.Font) {
       const info = getWireInfo(wireH);
       const color = (ci === 0) ? OUTER_COLOR : HOLE_COLOR;
       console.log(`  Wire[${wireH}] '${ch}' c${ci}: edges=${info.edgeCount} closed=${info.isClosed}`);
-      drawWire(wireH, color, 2);
+      drawWire(wireH, color, 8);
     });
 
     if (charWireHandles.length === 0) continue;
