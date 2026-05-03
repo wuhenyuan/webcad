@@ -230,3 +230,8 @@ emscripten::val occBuildFacesFromWires(emscripten::val wireHandles, int shapeHan
 // builds side walls as triangle faces sampled along corresponding edges,
 // then sews all faces → shell → MakeSolid.
 int  occBuildSolidFromFace(int faceHandle, double thickness);
+
+// Validate a solid by shape handle — checks closure, volume sign,
+// edge manifoldness, and max tolerance.  Reverses the solid if
+// volume is negative.  Returns true if the solid is manifold.
+bool occIsSolidManifold(int solidHandle);

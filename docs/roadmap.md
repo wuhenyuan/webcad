@@ -68,9 +68,66 @@ glyph → UV control points
 
 ---
 
+## 路线 4（当前）：Face → Solid 偏移挤出
+
+```
+TopoDS_Face (底面, 带孔洞)
+  → 提取 Geom_Surface + wires
+  → 创建偏移曲面 (Cylinder: 新建 R+h / 其他: Geom_OffsetSurface)
+  → cloneWireOnSurface: 复用 pcurve → MakeEdge(pcurve, offsetSurf) → 顶面 Wire
+  → BRepBuilderAPI_MakeFace(offsetSurf, clonedWires) → 顶面
+  → ShapeFix_Face + BuildCurves3d + SameParameter (顶面加固)
+  → 顶面 Orientation = 底面反向 (法线指向实体外部)
+  → buildSideFaces: pcurve 均匀采样 → 两侧曲面求值 → 三角面侧壁
+  → BRepBuilderAPI_Sewing (底面 + 顶面 + 三角侧壁)
+  → BuildCurves3d + SameParameter (全局加固)
+  → TopExp_Explorer 提取 Shell → BRepBuilderAPI_MakeSolid
+  → TopoDS_Solid
+```
+
+**关键设计决策：**
+
+| 决策 | 原因 |
+|------|------|
+| 顶面复用底面 pcurve | 偏移曲面与原曲面共享 UV 参数空间，直接复用保证点对点对齐 |
+| 不使用 BRepAlgoAPI 布尔 | WASM 版 OCCT 布尔运算不稳定，全程 BRepBuilderAPI |
+| 侧壁用三角面近似 | 四边直纹面的曲面构建依赖 GeomFill/TKOffset，超出当前链接库范围 |
+| ShapeFix_Face 修复顶面 | clone 后的 edge 组成 wire 再 MakeFace，可能产生微小不一致，ShapeFix 修复 |
+| 圆柱面用原生 Geom_CylindricalSurface | 避免 Geom_OffsetSurface 在 WASM mesher 中可能不产生三角形的问题 |
+
+**当前限制：**
+- 侧壁为三角面近似（每条边 8 段），非真正的直纹面
+- 仅支持圆柱面的原生偏移；其他曲面用 Geom_OffsetSurface
+
+---
+
+## 路线 4a：流形验证 IsSolidManifold
+
+```
+TopoDS_Solid
+  → BRepCheck_Analyzer           → 闭合性 (NotClosed → 报错)
+  → GProp_GProps + BRepGProp     → 体积检查 (负值 → solid.Reverse())
+  → TopExp::MapShapesAndAncestors → 边共享 (每条边 = 2 个 Face, 非流形检测)
+  → BRep_Tool::Tolerance         → 最大容差 (>0.1mm → 警告)
+  → 结果输出 (MANIFOLD / NON-MANIFOLD)
+```
+
+**检查项：**
+
+| 检查 | 方法 | 失败处理 |
+|------|------|---------|
+| 闭合性 | `BRepCheck_Analyzer::IsValid()` | 标记 non-manifold |
+| 体积 | `BRepGProp::VolumeProperties` | 负值 → `solid.Reverse()` |
+| 边共享 | `TopExp::MapShapesAndAncestors(EDGE→FACE)` | 非 2 → 标记 non-manifold |
+| 容差 | `BRep_Tool::Tolerance` 遍历所有边 | >0.1mm → 警告 |
+
+---
+
 ## 待完成
 
-- [ ] Face offset/extrude（沿曲面法线偏移 face → 浮雕实体）
+- [x] Face offset/extrude（沿曲面法线偏移 face → 浮雕实体）
+- [x] IsSolidManifold 流形验证
 - [ ] 布尔运算（text face 与圆柱面 Cut/Common）
 - [ ] 接缝处理（glyph 跨越圆柱 u=0/2π 时 wire 切割）
+- [ ] 侧壁升级为真正直纹面（BRepFill 或 GeomFill）
 - [ ] hole wire 的 pcurve 提取：`signedAreaUV` 的 `CurveOnSurface` 对 hole edge 可能返回 null

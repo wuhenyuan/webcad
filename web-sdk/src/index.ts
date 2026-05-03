@@ -480,3 +480,10 @@ export function buildSolidFromFace(faceHandle: number, thickness: number): numbe
   if (!_m) throw new Error('Not initialized.');
   return _m.occBuildSolidFromFace(faceHandle, thickness);
 }
+
+// Validate a solid: closure, volume sign, edge sharing, tolerance.
+// Returns true if the solid is manifold.
+export function isSolidManifold(solidHandle: number): boolean {
+  if (!_m) throw new Error('Not initialized.');
+  return _m.occIsSolidManifold(solidHandle);
+}

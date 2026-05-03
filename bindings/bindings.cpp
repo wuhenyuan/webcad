@@ -199,4 +199,5 @@ EMSCRIPTEN_BINDINGS(FaceSplitBindings) {
 
 EMSCRIPTEN_BINDINGS(SolidFromFaceBindings) {
     function("occBuildSolidFromFace", &occBuildSolidFromFace);
+    function("occIsSolidManifold",   &occIsSolidManifold);
 }
