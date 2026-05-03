@@ -66,6 +66,8 @@
 #include <BRepTopAdaptor_FClass2d.hxx>
 #include <Geom2d_BezierCurve.hxx>
 #include <TColgp_Array1OfPnt2d.hxx>
+#include <BRepLib.hxx>
+#include <ShapeFix_Face.hxx>
 
 #include <cmath>
 #include <cstdio>
@@ -1647,9 +1649,11 @@ emscripten::val occBuildFacesFromWires(emscripten::val wireHandles, int shapeHan
     for (int i = 0; i < N; i++) {
         if (depth[i] % 2 != 0) continue; // hole, skip
 
-        // Normalize outer winding
+        // Normalize outer winding: outer must be CCW (UV area > 0)
         TopoDS_Wire outerFixed = wdat[i].wire;
         double outerUV = signedAreaUV(outerFixed, surf);
+        printf("  [occ]   outer[%d] UV_area=%.4g (%s)\n",
+               i, outerUV, (outerUV > 0) ? "CCW OK" : (outerUV < 0 ? "CW→FLIP" : "ZERO"));
         if (outerUV < 0) outerFixed = TopoDS::Wire(wdat[i].wire.Reversed());
 
         // Collect direct holes: depth = depth[i]+1 AND parent = i
@@ -1665,6 +1669,8 @@ emscripten::val occBuildFacesFromWires(emscripten::val wireHandles, int shapeHan
         for (int hi : holeIdx) {
             TopoDS_Wire holeFixed = wdat[hi].wire;
             double holeUV = signedAreaUV(holeFixed, surf);
+            printf("  [occ]     hole[%d] UV_area=%.4g (%s)\n",
+                   hi, holeUV, (holeUV < 0) ? "CW OK" : (holeUV > 0 ? "CCW→FLIP" : "ZERO"));
             if (holeUV > 0) holeFixed = TopoDS::Wire(wdat[hi].wire.Reversed());
             faceBuilder.Add(holeFixed);
         }
@@ -1675,7 +1681,42 @@ emscripten::val occBuildFacesFromWires(emscripten::val wireHandles, int shapeHan
             continue;
         }
         TopoDS_Face face = faceBuilder.Face();
+
+        // ---- Hardening step 1: Seam proximity check ----
+        if (surf->IsUPeriodic()) {
+            double period = surf->UPeriod();
+            double uMin, uMax, vMin, vMax;
+            BRepTools::UVBounds(face, uMin, uMax, vMin, vMax);
+            // Check if wire UV is near or crosses the seam
+            double du = uMax - uMin;
+            if (du > period * 0.8 || uMin < 0 || uMax > period) {
+                printf("  [occ]   ⚠ face[%d] near/crosses seam: u=[%.3f,%.3f] period=%.3f\n",
+                       (int)g_shapeRegistry.size(), uMin, uMax, period);
+            }
+        }
+
+        // ---- Hardening step 2: Build 3D curves + sync parameters ----
+        // Edges from MakeEdge(curve2d,surface) have pcurves but may lack
+        // proper 3D curves. BuildCurves3d computes them from pcurve+surface.
+        // SameParameter syncs 3D curve & pcurve parameter ranges (required for booleans).
+        {
+            TopExp_Explorer edgeEx;
+            for (edgeEx.Init(face, TopAbs_EDGE); edgeEx.More(); edgeEx.Next()) {
+                TopoDS_Edge& E = (TopoDS_Edge&)edgeEx.Current();
+                BRepLib::BuildCurves3d(E);
+                BRepLib::SameParameter(E);
+            }
+        }
+
+        // ---- Hardening step 3: Tolerance alignment via ShapeFix_Face ----
+        {
+            ShapeFix_Face fixer(face);
+            fixer.Perform();
+            face = fixer.Face();
+        }
+
         BRepCheck_Analyzer chk(face);
+
         int h = static_cast<int>(g_shapeRegistry.size());
         g_shapeRegistry.push_back(face);
         result.call<void>("push", h);
