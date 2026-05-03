@@ -35,7 +35,7 @@ else
     echo "    Run: bash build_occt.sh"
 fi
 
-python "$EMSDK_PYTHON" "$emsdk_dir/upstream/emscripten/emcc.py" \
+"$EMSDK_PYTHON" "$emsdk_dir/upstream/emscripten/emcc.py" \
   bindings.cpp ../core/geometry.cpp ../core/occ_geometry.cpp \
   -o geometry_module.js \
   --bind \

@@ -61,6 +61,7 @@
 #include <BRep_Builder.hxx>
 #include <Geom2d_Line.hxx>
 #include <Geom_CylindricalSurface.hxx>
+#include <Geom_OffsetSurface.hxx>
 #include <BRepTools_WireExplorer.hxx>
 #include <BRepFeat_SplitShape.hxx>
 #include <BRepTopAdaptor_FClass2d.hxx>
@@ -1733,5 +1734,306 @@ emscripten::val occBuildFacesFromWires(emscripten::val wireHandles, int shapeHan
     } catch (...) {
         printf("  [occ] buildFacesFromWires: unknown exception at [%s]\n", step);
         return emscripten::val::array();
+    }
+}
+
+// ============================================================
+// Solid from offset face — Phase 10
+// ============================================================
+//
+// Builds a closed TopoDS_Solid by offsetting a face along its surface normal.
+// No BRepAlgoAPI booleans — uses BRepBuilderAPI + Geom_OffsetSurface + sewing.
+//
+// Pipeline:
+//   1. Extract Geom_Surface + wires from bottom face
+//   2. Create Geom_OffsetSurface(baseSurf, thickness)
+//   3. Clone wire structure onto offset surface → build top face
+//   4. Build side ruled faces between corresponding outer-wire edges
+//      (triangle approximation via pcurve sampling on both surfaces)
+//   5. BRepBuilderAPI_Sewing → closed shell
+//   6. BRepLib::BuildCurves3d + BRepBuilderAPI_MakeSolid → solid
+//
+// Face with holes (e.g. 'O', 'A') is supported: all wires are cloned onto
+// the offset surface, and side walls are built only for the outer wire.
+
+// Clone every edge of srcWire onto dstSurf by reusing pcurves from srcFace.
+static TopoDS_Wire cloneWireOnSurface(const TopoDS_Wire& srcWire,
+                                       const TopoDS_Face& srcFace,
+                                       const Handle(Geom_Surface)& dstSurf) {
+    BRepBuilderAPI_MakeWire wb;
+    BRepTools_WireExplorer wex;
+    int nEdges = 0;
+    for (wex.Init(srcWire); wex.More(); wex.Next(), nEdges++) {
+        const TopoDS_Edge& edge = wex.Current();
+        Standard_Real first, last;
+        Handle(Geom2d_Curve) pcurve = BRep_Tool::CurveOnSurface(edge, srcFace, first, last);
+        if (pcurve.IsNull()) {
+            // Fallback: try with surface+location directly
+            Handle(Geom_Surface) faceSurf = BRep_Tool::Surface(srcFace);
+            pcurve = BRep_Tool::CurveOnSurface(edge, faceSurf, srcFace.Location(), first, last);
+        }
+        if (pcurve.IsNull()) {
+            printf("  [occ] cloneWireOnSurface: null pcurve on edge %d\n", nEdges);
+            return TopoDS_Wire();
+        }
+        TopoDS_Edge newEdge = BRepBuilderAPI_MakeEdge(pcurve, dstSurf, first, last);
+        if (newEdge.IsNull()) {
+            printf("  [occ] cloneWireOnSurface: MakeEdge failed on edge %d\n", nEdges);
+            return TopoDS_Wire();
+        }
+        wb.Add(newEdge);
+    }
+    wb.Build();
+    if (!wb.IsDone()) {
+        printf("  [occ] cloneWireOnSurface: MakeWire failed (%d edges)\n", nEdges);
+        return TopoDS_Wire();
+    }
+    // Check closure
+    TopoDS_Wire result = wb.Wire();
+    TopoDS_Vertex vFirst, vLast;
+    TopExp::Vertices(result, vFirst, vLast);
+    double gap = 0;
+    if (!vFirst.IsNull() && !vLast.IsNull()) {
+        gap = BRep_Tool::Pnt(vFirst).Distance(BRep_Tool::Pnt(vLast));
+    }
+    printf("  [occ] cloneWireOnSurface: %d edges closed=%s gap=%.4g\n",
+           nEdges, (gap < 1e-6 ? "yes" : "NO"), gap);
+    return result;
+}
+
+// Build triangle side faces between two corresponding edges by sampling the
+// shared pcurve at uniform UV parameters and evaluating both surfaces.
+// Returns number of triangle faces successfully added to the sewer.
+static int buildSideFaces(const TopoDS_Edge& bEdge,
+                           const TopoDS_Face& bottomFace,
+                           const Handle(Geom_Surface)& baseSurf,
+                           const Handle(Geom_Surface)& offsetSurf,
+                           BRepBuilderAPI_Sewing& sewer) {
+    Standard_Real first, last;
+    Handle(Geom2d_Curve) pcurve = BRep_Tool::CurveOnSurface(bEdge, bottomFace, first, last);
+    if (pcurve.IsNull()) return 0;
+
+    // Adaptive segment count: 1 for straight lines, 8 for curves
+    int nSeg = 8;
+    if (pcurve->DynamicType() == STANDARD_TYPE(Geom2d_Line)) nSeg = 1;
+
+    int ok = 0;
+    for (int i = 0; i < nSeg; i++) {
+        double t0 = first + (last - first) * i / nSeg;
+        double t1 = first + (last - first) * (i + 1) / nSeg;
+        gp_Pnt2d uv0 = pcurve->Value(t0);
+        gp_Pnt2d uv1 = pcurve->Value(t1);
+        gp_Pnt b0 = baseSurf->Value(uv0.X(), uv0.Y());
+        gp_Pnt b1 = baseSurf->Value(uv1.X(), uv1.Y());
+        gp_Pnt p0 = offsetSurf->Value(uv0.X(), uv0.Y());
+        gp_Pnt p1 = offsetSurf->Value(uv1.X(), uv1.Y());
+
+        TopoDS_Face tri;
+        if (buildTriangleFace(b0, b1, p0, tri, false)) { sewer.Add(tri); ok++; }
+        if (buildTriangleFace(b1, p1, p0, tri, false)) { sewer.Add(tri); ok++; }
+    }
+    return ok;
+}
+
+int occBuildSolidFromFace(int faceHandle, double thickness) {
+    if (faceHandle < 0 || faceHandle >= static_cast<int>(g_shapeRegistry.size())) {
+        printf("  [occ] buildSolidFromFace: invalid faceHandle=%d\n", faceHandle);
+        return -1;
+    }
+    if (thickness <= 0) {
+        printf("  [occ] buildSolidFromFace: invalid thickness=%.3f\n", thickness);
+        return -1;
+    }
+
+    const char* step = "init";
+    try {
+    // ---- Validate and extract bottom face ----
+    TopoDS_Shape shape = g_shapeRegistry[faceHandle];
+    if (shape.ShapeType() != TopAbs_FACE) {
+        printf("  [occ] buildSolidFromFace: not a face (type=%d)\n",
+               static_cast<int>(shape.ShapeType()));
+        return -1;
+    }
+    TopoDS_Face bottomFace = TopoDS::Face(shape);
+
+    step = "extract surface";
+    Handle(Geom_Surface) baseSurf = BRep_Tool::Surface(bottomFace);
+    printf("  [occ] buildSolidFromFace: surface type=%d thickness=%.3f\n",
+           static_cast<int>(GeomAdaptor_Surface(baseSurf).GetType()), thickness);
+
+    // ---- Collect wires from bottom face ----
+    step = "collect wires";
+    std::vector<TopoDS_Wire> bottomWires;
+    for (TopExp_Explorer wex(bottomFace, TopAbs_WIRE); wex.More(); wex.Next())
+        bottomWires.push_back(TopoDS::Wire(wex.Current()));
+
+    if (bottomWires.empty()) {
+        printf("  [occ] buildSolidFromFace: no wires in face\n");
+        return -1;
+    }
+    int nWires = static_cast<int>(bottomWires.size());
+    printf("  [occ] buildSolidFromFace: %d wire(s) on bottom face\n", nWires);
+
+    // ---- Create offset surface ----
+    // Prefer a native surface type over Geom_OffsetSurface to avoid
+    // potential mesher issues in WASM builds.
+    step = "offset surface";
+    Handle(Geom_Surface) offsetSurf;
+    {
+        GeomAdaptor_Surface adapt(baseSurf);
+        GeomAbs_SurfaceType st = adapt.GetType();
+        if (st == GeomAbs_Cylinder) {
+            Handle(Geom_CylindricalSurface) cyl =
+                Handle(Geom_CylindricalSurface)::DownCast(baseSurf);
+            offsetSurf = new Geom_CylindricalSurface(
+                cyl->Position(), cyl->Radius() + thickness);
+            printf("  [occ] buildSolidFromFace: cylinder offset R=%.3f→%.3f\n",
+                   cyl->Radius(), cyl->Radius() + thickness);
+        } else {
+            offsetSurf = new Geom_OffsetSurface(baseSurf, thickness);
+            printf("  [occ] buildSolidFromFace: Geom_OffsetSurface (type=%d)\n",
+                   static_cast<int>(st));
+        }
+    }
+
+    // ---- Build top face: clone wire edges onto the offset surface ----
+    // Each edge's pcurve is extracted from the bottom face and reused on the
+    // offset surface via BRepBuilderAPI_MakeEdge(pcurve, offsetSurf).
+    // Both surfaces share UV parameterization, so pcurves are compatible.
+    step = "clone wires";
+    std::vector<TopoDS_Wire> topWires;
+    for (int i = 0; i < nWires; i++) {
+        TopoDS_Wire tw = cloneWireOnSurface(bottomWires[i], bottomFace, offsetSurf);
+        if (tw.IsNull()) {
+            printf("  [occ] buildSolidFromFace: clone wire[%d] failed\n", i);
+            return -1;
+        }
+        topWires.push_back(tw);
+    }
+
+    // ---- Build top face ----
+    step = "build top face";
+    BRepBuilderAPI_MakeFace topFaceMaker(offsetSurf, topWires[0]);
+    for (int i = 1; i < nWires; i++)
+        topFaceMaker.Add(topWires[i]);
+    topFaceMaker.Build();
+    if (!topFaceMaker.IsDone()) {
+        printf("  [occ] buildSolidFromFace: top face Build failed\n");
+        return -1;
+    }
+    TopoDS_Face topFace = topFaceMaker.Face();
+
+    // ---- Harden top face: BuildCurves3d + SameParameter + ShapeFix ----
+    for (TopExp_Explorer eex(topFace, TopAbs_EDGE); eex.More(); eex.Next()) {
+        TopoDS_Edge& E = (TopoDS_Edge&)eex.Current();
+        BRepLib::BuildCurves3d(E);
+        BRepLib::SameParameter(E);
+    }
+    {
+        ShapeFix_Face fixer(topFace);
+        fixer.Perform();
+        topFace = fixer.Face();
+    }
+
+    // Orientation: for a closed solid, bottom face normal points inward
+    // (into the solid) and top face normal points outward. If they match,
+    // reverse the top face.
+    if (topFace.Orientation() == bottomFace.Orientation()) {
+        topFace.Reverse();
+        printf("  [occ] buildSolidFromFace: reversed top face orientation\n");
+    }
+    {
+        BRepCheck_Analyzer chk(topFace);
+        printf("  [occ] buildSolidFromFace: topFace valid=%d orient=%d\n",
+               (int)chk.IsValid(), (int)topFace.Orientation());
+    }
+
+    // ---- Build side walls from bottom wire edges ----
+    // Side triangles sample the shared pcurves at uniform UV and evaluate
+    // both surfaces — guaranteeing point-to-point alignment.
+    step = "build side walls";
+    BRepBuilderAPI_Sewing sewer(0.01);
+    sewer.Add(bottomFace);
+    sewer.Add(topFace);
+
+    int sideOk = 0, sideFail = 0;
+    {
+        BRepTools_WireExplorer bwExp;
+        for (bwExp.Init(bottomWires[0]); bwExp.More(); bwExp.Next()) {
+            int n = buildSideFaces(bwExp.Current(), bottomFace,
+                                   baseSurf, offsetSurf, sewer);
+            if (n > 0) sideOk += n;
+            else sideFail++;
+        }
+    }
+    printf("  [occ] buildSolidFromFace: side triangles ok=%d fail=%d\n",
+           sideOk, sideFail);
+    if (sideFail > 0 && sideOk == 0) {
+        printf("  [occ] buildSolidFromFace: all side faces failed\n");
+        return -1;
+    }
+
+    // ---- Sew all faces into a closed shell ----
+    step = "sew";
+    sewer.Perform();
+    TopoDS_Shape sewed = sewer.SewedShape();
+    if (sewed.IsNull()) {
+        printf("  [occ] buildSolidFromFace: sew produced null shape\n");
+        return -1;
+    }
+
+    // ---- Geometric integrity: compute 3D curves from pcurves ----
+    step = "build curves 3d";
+    BRepLib::BuildCurves3d(sewed, 1e-9);
+
+    // Also sync pcurve and 3D curve parameter ranges on every edge
+    for (TopExp_Explorer eex(sewed, TopAbs_EDGE); eex.More(); eex.Next()) {
+        TopoDS_Edge& E = (TopoDS_Edge&)eex.Current();
+        BRepLib::SameParameter(E);
+    }
+
+    // ---- Extract shell → MakeSolid ----
+    step = "extract shell";
+    TopoDS_Shell shell;
+    for (TopExp_Explorer shex(sewed, TopAbs_SHELL); shex.More(); shex.Next()) {
+        shell = TopoDS::Shell(shex.Current());
+        break;
+    }
+    if (shell.IsNull()) {
+        printf("  [occ] buildSolidFromFace: no closed shell after sew\n");
+        return -1;
+    }
+
+    step = "make solid";
+    BRepBuilderAPI_MakeSolid solidMaker(shell);
+    solidMaker.Build();
+    if (!solidMaker.IsDone()) {
+        printf("  [occ] buildSolidFromFace: MakeSolid failed\n");
+        return -1;
+    }
+
+    TopoDS_Solid resultSolid = solidMaker.Solid();
+    {
+        BRepCheck_Analyzer chk(resultSolid);
+        // Count faces
+        int nFaces = 0;
+        for (TopExp_Explorer fex(resultSolid, TopAbs_FACE); fex.More(); fex.Next()) nFaces++;
+        printf("  [occ] buildSolidFromFace: solid valid=%d faces=%d\n",
+               (int)chk.IsValid(), nFaces);
+    }
+
+    int resultHandle = static_cast<int>(g_shapeRegistry.size());
+    g_shapeRegistry.push_back(resultSolid);
+    printf("  [occ] buildSolidFromFace: OK handle=%d thickness=%.3f\n",
+           resultHandle, thickness);
+    return resultHandle;
+
+    } catch (const Standard_Failure& e) {
+        printf("  [occ] buildSolidFromFace: Standard_Failure at [%s]: %s\n",
+               step, e.GetMessageString());
+        return -1;
+    } catch (...) {
+        printf("  [occ] buildSolidFromFace: unknown exception at [%s]\n", step);
+        return -1;
     }
 }

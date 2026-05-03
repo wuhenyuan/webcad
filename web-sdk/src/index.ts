@@ -468,3 +468,15 @@ export function buildFacesFromWires(wireHandles: number[], shapeHandle: number, 
   for (let i = 0; i < n; i++) out[i] = arr[i];
   return out;
 }
+
+// ============================================================
+// Solid from offset face — Phase 10
+// ============================================================
+// Build a closed solid by offsetting a face along its surface normal.
+//   faceHandle: bottom face handle (must be a TopoDS_Face)
+//   thickness:  offset distance along surface normal (>0)
+// Returns solid handle, or -1 on failure.
+export function buildSolidFromFace(faceHandle: number, thickness: number): number {
+  if (!_m) throw new Error('Not initialized.');
+  return _m.occBuildSolidFromFace(faceHandle, thickness);
+}

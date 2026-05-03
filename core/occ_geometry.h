@@ -216,3 +216,17 @@ int  occMakeFaceFromWire(int shapeHandle, int faceIndex, int wireHandle, emscrip
 // Uses BRepTopAdaptor_FClass2d to determine wire containment (no winding assumptions).
 // Returns JS array of int face handles (each already has its holes).
 emscripten::val occBuildFacesFromWires(emscripten::val wireHandles, int shapeHandle, int faceIndex);
+
+// ============================================================
+// Solid from offset face — Phase 10
+// ============================================================
+//
+// Build a closed TopoDS_Solid by offsetting a face along its surface normal.
+//   faceHandle: bottom face (must be a TopoDS_Face in g_shapeRegistry)
+//   thickness:  offset distance along surface normal (>0)
+// Returns solid handle, or -1 on failure.
+//
+// Uses Geom_OffsetSurface for the top face, clones pcurves to rebuild wires,
+// builds side walls as triangle faces sampled along corresponding edges,
+// then sews all faces → shell → MakeSolid.
+int  occBuildSolidFromFace(int faceHandle, double thickness);

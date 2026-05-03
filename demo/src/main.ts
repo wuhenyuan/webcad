@@ -6,6 +6,7 @@ import {
   createCylinderShape, getFaceInfo, occMakeCylinder,
   getWireInfo, sampleWire3D, releaseWireHandle,
   makeWireFromUVCurves, buildFacesFromWires,
+  buildSolidFromFace,
   tessellateShape, tessellateFaceMesh, getTopologyInfo,
   releaseShapeHandle,
   OccWireInfoData, OccTopologyInfoData, SURFACE_TYPE_NAMES,
@@ -42,6 +43,7 @@ const state = {
   offsetV: 0.0,
   uvScale: 2.5,
   embossDepth: 0.12,
+  solidThickness: 0.08,
   letterSpacing: 0.0,
   deflection: 0.05,
 };
@@ -149,7 +151,8 @@ function createMesh(pos: Float32Array, nor: Float32Array, idx: Uint32Array, colo
   const mat = new THREE.MeshStandardMaterial({
     color, roughness: 0.4, metalness: 0.05,
     side: THREE.DoubleSide,
-    transparent: true, opacity,
+    // transparent: opacity < 1, opacity,
+    transparent: false,
     wireframe,
   });
   if (polyOffset) {
@@ -229,14 +232,25 @@ function rebuildAll(cylHandle: number, fi: number, font: opentype.Font) {
 
       const faceInfo = getFaceInfo(fh, 0);
       const typeName = SURFACE_TYPE_NAMES[faceInfo.surfaceType] ?? '?';
-      const onCyl = faceInfo.surfaceType === 1;
-      console.log(`  Face[${fh}] '${ch}': ${typeName} UV=[${faceInfo.uMin.toFixed(3)},${faceInfo.uMax.toFixed(3)}]x[${faceInfo.vMin.toFixed(3)},${faceInfo.vMax.toFixed(3)}] ${onCyl ? 'OK' : 'WARN'}`);
+      console.log(`  Face[${fh}] '${ch}': ${typeName} UV=[${faceInfo.uMin.toFixed(3)},${faceInfo.uMax.toFixed(3)}]x[${faceInfo.vMin.toFixed(3)},${faceInfo.vMax.toFixed(3)}]`);
 
-      const fm = tessellateFaceMesh(fh, 0, state.deflection);
-      if (fm.positions.length > 0) {
-        const color = FACE_COLORS[fi % FACE_COLORS.length];
-        dyn.add(createMesh(fm.positions, fm.normals, fm.indices, color, 0.8, false, true));
-        dyn.add(createMesh(fm.positions, fm.normals, fm.indices, 0x003344, 0.15, true, true));
+      // ---- Build solid from face ----
+      const solidHandle = buildSolidFromFace(fh, state.solidThickness);
+      if (solidHandle >= 0) {
+        shapeHandles.push(solidHandle);
+        console.log(`  Solid[${solidHandle}] '${ch}': thickness=${state.solidThickness}`);
+        const topo = getTopologyInfo(solidHandle);
+        console.log(`  Solid[${solidHandle}] topo: faces=${topo.numFaces} edges=${topo.numEdges} shells=${topo.numShells}`);
+        const sm = tessellateShape(solidHandle, state.deflection);
+        console.log(`  Solid[${solidHandle}] mesh: ${sm.positions.length / 3} vertices, ${sm.indices.length / 3} triangles`);
+        if (sm.positions.length > 0) {
+          dyn.add(createMesh(sm.positions, sm.normals, sm.indices, 0xff8844, 1.0, false, true));
+          dyn.add(createMesh(sm.positions, sm.normals, sm.indices, 0x221100, 1.0, true, true));
+        } else {
+          console.log(`  Solid[${solidHandle}]: empty tessellation!`);
+        }
+      } else {
+        console.log(`  Solid '${ch}': FAILED`);
       }
     });
 
@@ -402,7 +416,7 @@ async function main() {
   cylGeo.setIndex(new THREE.BufferAttribute(cylData.indices, 1));
   scene.add(new THREE.Mesh(cylGeo, new THREE.MeshStandardMaterial({
     color: 0x334455, roughness: 0.5, metalness: 0.1,
-    side: THREE.DoubleSide, transparent: true, opacity: 0.25,
+    side: THREE.DoubleSide, transparent: false, opacity: 0.25,
   })));
 
   const onChange = () => rebuildAll(cylHandle, 0, font);

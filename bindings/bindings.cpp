@@ -194,3 +194,9 @@ EMSCRIPTEN_BINDINGS(FaceSplitBindings) {
     function("occSplitFaceByWire",      &occSplitFaceByWire);
     function("occGetSplitFaces",        &occGetSplitFaces);
 }
+
+// ---- Phase 10: Solid from offset face bindings ----
+
+EMSCRIPTEN_BINDINGS(SolidFromFaceBindings) {
+    function("occBuildSolidFromFace", &occBuildSolidFromFace);
+}
