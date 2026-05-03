@@ -198,6 +198,7 @@ EMSCRIPTEN_BINDINGS(FaceSplitBindings) {
 // ---- Phase 10: Solid from offset face bindings ----
 
 EMSCRIPTEN_BINDINGS(SolidFromFaceBindings) {
-    function("occBuildSolidFromFace", &occBuildSolidFromFace);
-    function("occIsSolidManifold",   &occIsSolidManifold);
+    function("occBuildSolidFromFace",       &occBuildSolidFromFace);
+    function("occBuildSolidFromFaceManual", &occBuildSolidFromFaceManual);
+    function("occIsSolidManifold",          &occIsSolidManifold);
 }

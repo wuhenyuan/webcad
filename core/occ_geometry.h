@@ -231,6 +231,10 @@ emscripten::val occBuildFacesFromWires(emscripten::val wireHandles, int shapeHan
 // then sews all faces → shell → MakeSolid.
 int  occBuildSolidFromFace(int faceHandle, double thickness);
 
+// Manual sew method: clone pcurves → offset surface → side walls → sew → solid.
+// Preserves full control over topology; produces more faces for curved edges.
+int  occBuildSolidFromFaceManual(int faceHandle, double thickness);
+
 // Validate a solid by shape handle — checks closure, volume sign,
 // edge manifoldness, and max tolerance.  Reverses the solid if
 // volume is negative.  Returns true if the solid is manifold.
