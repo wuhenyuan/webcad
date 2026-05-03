@@ -176,3 +176,43 @@ OccTopologyInfo occGetTopologyInfo(int shapeHandle);
 // offset: emboss depth along surface normal (positive = outward)
 // samplesPerEdge: number of sample points per wire edge (>= 2)
 int  occBuildEmboss(int wireHandle, double radius, double offset, int samplesPerEdge);
+
+// Retrieve last-created emboss faces for separate rendering
+int  occGetLastBottomFace();
+int  occGetLastTopFace();
+
+// ============================================================
+// Face splitting via BRepFeat_SplitShape — Phase 8
+// ============================================================
+//
+// Build a TopoDS_Wire from analytic UV curve segments on a face's surface.
+// Each segment is a Geom2d_BezierCurve (degree 1/2/3 for line/quad/cubic).
+// Edges are built via BRepBuilderAPI_MakeEdge(curve2d, surface) — the 3D
+// geometry is computed by composing the 2D curve with the surface
+// parameterization, so edges truly lie on the surface.
+// uvData: Float64Array — [numSegments, type0, npts0, u0,v0, u1,v1, ..., type1, ...]
+//   type=1 line(2pts)  type=2 quad(3pts)  type=3 cubic(4pts)
+// shapeHandle: shape whose face surface to use
+// faceIndex: which face to take the surface from
+// closeWire: if true, ensure wire is closed (add closing edge if needed)
+int  occMakeWireFromUVCurves(emscripten::val uvData, int shapeHandle, int faceIndex, bool closeWire);
+
+// Split a face of an existing shape using a wire that lies on that face.
+// shapeHandle: handle into g_shapeRegistry (the complete shape, e.g. cylinder solid)
+// faceIndex: which face to split (0-based)
+// wireHandle: handle into g_wireRegistry (must have pcurves on the same surface)
+// Returns new shape handle for the result, or -1 on failure.
+int  occSplitFaceByWire(int shapeHandle, int faceIndex, int wireHandle);
+
+// Get the sub-face handles from the last occSplitFaceByWire call.
+// Returns JS array of int handles.
+emscripten::val occGetSplitFaces();
+
+// Create a trimmed face from a surface + outer wire + optional hole wires.
+int  occMakeFaceFromWire(int shapeHandle, int faceIndex, int wireHandle, emscripten::val holeWireHandles);
+
+// Build faces from a set of wires using nesting-depth classification.
+// All wires are on the surface from shapeHandle/faceIndex.
+// Uses BRepTopAdaptor_FClass2d to determine wire containment (no winding assumptions).
+// Returns JS array of int face handles (each already has its holes).
+emscripten::val occBuildFacesFromWires(emscripten::val wireHandles, int shapeHandle, int faceIndex);

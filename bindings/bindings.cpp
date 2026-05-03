@@ -180,5 +180,17 @@ EMSCRIPTEN_BINDINGS(FaceSolidBindings) {
 // ---- Phase 7: Surface-aware emboss bindings ----
 
 EMSCRIPTEN_BINDINGS(EmbossBindings) {
-    function("occBuildEmboss", &occBuildEmboss);
+    function("occBuildEmboss",      &occBuildEmboss);
+    function("occGetLastBottomFace",&occGetLastBottomFace);
+    function("occGetLastTopFace",   &occGetLastTopFace);
+}
+
+// ---- Phase 8: Face splitting bindings ----
+
+EMSCRIPTEN_BINDINGS(FaceSplitBindings) {
+    function("occMakeWireFromUVCurves", &occMakeWireFromUVCurves);
+    function("occMakeFaceFromWire",     &occMakeFaceFromWire);
+    function("occBuildFacesFromWires",  &occBuildFacesFromWires);
+    function("occSplitFaceByWire",      &occSplitFaceByWire);
+    function("occGetSplitFaces",        &occGetSplitFaces);
 }

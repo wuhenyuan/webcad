@@ -27,6 +27,7 @@ if [ -d "$OCCT_LIB" ] && [ -f "$OCCT_LIB/libTKernel.a" ]; then
         -lTKBRep -lTKGeomBase -lTKGeomAlgo \
         -lTKG3d -lTKG2d \
         -lTKMath -lTKernel \
+        -lTKFeat \
         -Wl,--start-group -Wl,--end-group \
         -sDISABLE_EXCEPTION_CATCHING=0"
 else

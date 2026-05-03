@@ -57,9 +57,20 @@
 #include <gp_Pln.hxx>
 #include <gp_Cylinder.hxx>
 #include <Standard_Failure.hxx>
+#include <BRepCheck_Analyzer.hxx>
+#include <BRep_Builder.hxx>
+#include <Geom2d_Line.hxx>
+#include <Geom_CylindricalSurface.hxx>
+#include <BRepTools_WireExplorer.hxx>
+#include <BRepFeat_SplitShape.hxx>
+#include <BRepTopAdaptor_FClass2d.hxx>
+#include <Geom2d_BezierCurve.hxx>
+#include <TColgp_Array1OfPnt2d.hxx>
 
 #include <cmath>
 #include <cstdio>
+#include <algorithm>
+#include <functional>
 
 // ---- Internal: tessellate any TopoDS_Shape → OccMesh ----
 
@@ -460,6 +471,7 @@ OccMesh occTessellateFaceMesh(int handle, int faceIndex, double deflection) {
 // For trimmed surfaces later, wires define the trimming boundary.
 
 static std::vector<TopoDS_Wire> g_wireRegistry;
+static std::vector<int> g_splitFaceHandles;  // Phase 8: sub-face handles from last split
 
 int occMakeWireFromPoints(emscripten::val pts3D, bool closeWire) {
     int n = pts3D["length"].as<int>();
@@ -636,6 +648,62 @@ void occReleaseWireHandle(int wireHandle) {
 // Face + Solid construction — Phase 6
 // ============================================================
 
+// Extract ordered 3D vertices from a wire using ordered edge traversal.
+static std::vector<gp_Pnt> extractWireVertices(const TopoDS_Wire& wire) {
+    std::vector<gp_Pnt> pts;
+    BRepTools_WireExplorer wex;
+    for (wex.Init(wire); wex.More(); wex.Next()) {
+        pts.push_back(BRep_Tool::Pnt(wex.CurrentVertex()));
+    }
+    return pts;
+}
+
+// Signed area of polygon projected to XY plane.
+// Positive = CCW, Negative = CW (right-hand rule, +Z normal).
+static double signedAreaXY(const std::vector<gp_Pnt>& pts) {
+    double area = 0;
+    int n = static_cast<int>(pts.size());
+    if (n < 3) return 0;
+    for (int i = 0; i < n; i++) {
+        int j = (i + 1) % n;
+        area += pts[i].X() * pts[j].Y() - pts[j].X() * pts[i].Y();
+    }
+    return area * 0.5;
+}
+
+// Signed area in UV parametric space using pcurve data.
+// Uses BRepTools_WireExplorer for ordered traversal + pcurve evaluation.
+// Positive = CCW in UV, Negative = CW.
+static double signedAreaUV(const TopoDS_Wire& wire, const Handle(Geom_Surface)& surf) {
+    std::vector<gp_Pnt2d> uvPts;
+    BRepTools_WireExplorer wex;
+    for (wex.Init(wire); wex.More(); wex.Next()) {
+        const TopoDS_Edge& edge = wex.Current();
+        Standard_Real first, last;
+        Handle(Geom2d_Curve) pcurve = BRep_Tool::CurveOnSurface(edge, surf, TopLoc_Location(), first, last);
+        if (!pcurve.IsNull()) {
+            uvPts.push_back(pcurve->Value(first));
+        }
+    }
+    if (uvPts.size() < 3) return 0;
+    // Add last point of last edge for closure
+    TopExp_Explorer ex;
+    TopoDS_Edge lastEdge;
+    for (ex.Init(wire, TopAbs_EDGE); ex.More(); ex.Next()) { lastEdge = TopoDS::Edge(ex.Current()); }
+    if (!lastEdge.IsNull()) {
+        Standard_Real first, last;
+        Handle(Geom2d_Curve) pcurve = BRep_Tool::CurveOnSurface(lastEdge, surf, TopLoc_Location(), first, last);
+        if (!pcurve.IsNull()) uvPts.push_back(pcurve->Value(last));
+    }
+    double area = 0;
+    int n = static_cast<int>(uvPts.size());
+    for (int i = 0; i < n; i++) {
+        int j = (i + 1) % n;
+        area += uvPts[i].X() * uvPts[j].Y() - uvPts[j].X() * uvPts[i].Y();
+    }
+    return area * 0.5;
+}
+
 int occMakeFace(int outerWireHandle, emscripten::val innerWireHandles) {
     if (outerWireHandle < 0 || outerWireHandle >= static_cast<int>(g_wireRegistry.size())) {
         printf("  [occ] makeFace: invalid outerWireHandle=%d\n", outerWireHandle);
@@ -644,18 +712,42 @@ int occMakeFace(int outerWireHandle, emscripten::val innerWireHandles) {
 
     const TopoDS_Wire& outerWire = g_wireRegistry[outerWireHandle];
 
-    // Create face on XY plane trimmed by outer wire
-    gp_Pln plane(gp::XOY());
-    BRepBuilderAPI_MakeFace faceBuilder(plane, outerWire);
+    // ---- Normalize outer wire winding: OCCT requires CCW ----
+    auto outerPts = extractWireVertices(outerWire);
+    double outerArea = signedAreaXY(outerPts);
+    const char* outerDir = (outerArea > 1e-12) ? "CCW" : ((outerArea < -1e-12) ? "CW" : "ZERO");
+    printf("  [occ] makeFace: outer wire[%d] signed_area=%.4g (%s) pts=%d\n",
+           outerWireHandle, outerArea, outerDir, (int)outerPts.size());
 
-    // Add hole wires
+    TopoDS_Wire outerFixed = outerWire;
+    if (outerArea < 0) {
+        outerFixed = TopoDS::Wire(outerWire.Reversed());
+        printf("  [occ] makeFace: reversed outer wire (CW→CCW)\n");
+    }
+
+    gp_Pln plane(gp::XOY());
+    BRepBuilderAPI_MakeFace faceBuilder(plane, outerFixed);
+
+    // ---- Add hole wires with winding check (holes must be CW) ----
     int numHoles = innerWireHandles["length"].as<int>();
     for (int i = 0; i < numHoles; i++) {
         int holeHandle = innerWireHandles[i].as<int>();
-        if (holeHandle >= 0 && holeHandle < static_cast<int>(g_wireRegistry.size())) {
-            faceBuilder.Add(g_wireRegistry[holeHandle]);
-            printf("  [occ] makeFace: added hole wire[%d]\n", holeHandle);
+        if (holeHandle < 0 || holeHandle >= static_cast<int>(g_wireRegistry.size())) continue;
+
+        const TopoDS_Wire& holeWire = g_wireRegistry[holeHandle];
+        auto holePts = extractWireVertices(holeWire);
+        double holeArea = signedAreaXY(holePts);
+        const char* holeDir = (holeArea > 1e-12) ? "CCW" : ((holeArea < -1e-12) ? "CW" : "ZERO");
+        printf("  [occ] makeFace: hole[%d] wire[%d] signed_area=%.4g (%s) pts=%d\n",
+               i, holeHandle, holeArea, holeDir, (int)holePts.size());
+
+        TopoDS_Wire holeFixed = holeWire;
+        if (holeArea > 0) {
+            holeFixed = TopoDS::Wire(holeWire.Reversed());
+            printf("  [occ] makeFace: reversed hole[%d] (CCW→CW)\n", i);
         }
+
+        faceBuilder.Add(holeFixed);
     }
 
     faceBuilder.Build();
@@ -665,6 +757,11 @@ int occMakeFace(int outerWireHandle, emscripten::val innerWireHandles) {
     }
 
     TopoDS_Shape face = faceBuilder.Shape();
+
+    // Verify face validity
+    BRepCheck_Analyzer chk(face);
+    printf("  [occ] makeFace: face valid=%d\n", (int)chk.IsValid());
+
     int handle = static_cast<int>(g_shapeRegistry.size());
     g_shapeRegistry.push_back(face);
 
@@ -778,6 +875,13 @@ static std::vector<gp_Pnt> offsetAlongCylinderNormals(const std::vector<gp_Pnt>&
     return result;
 }
 
+// Track last created bottom/top face handles for separate rendering
+static int g_lastBottomFaceH = -1;
+static int g_lastTopFaceH = -1;
+
+int occGetLastBottomFace() { return g_lastBottomFaceH; }
+int occGetLastTopFace()   { return g_lastTopFaceH; }
+
 // Create a triangular face from 3 points. Returns null face on failure.
 // Logs diagnostic info on first failure.
 static bool buildTriangleFace(const gp_Pnt& a, const gp_Pnt& b, const gp_Pnt& c,
@@ -853,6 +957,7 @@ int occBuildEmboss(int wireHandle, double radius, double offset, int samplesPerE
     }
     if (samplesPerEdge < 2) samplesPerEdge = 2;
 
+    TopoDS_Face bottomFace, topFace;
     const char* step = "init";
     try {
     const TopoDS_Wire& bottomWire = g_wireRegistry[wireHandle];
@@ -885,42 +990,69 @@ int occBuildEmboss(int wireHandle, double radius, double offset, int samplesPerE
     step = "2 offset";
     std::vector<gp_Pnt> topPts = offsetAlongCylinderNormals(bottomPts, radius, offset);
 
-    step = "3 topWire";
-    BRepBuilderAPI_MakeWire topWireBuilder;
-    {
+    // Build a wire from points using straight edges (for planar face creation)
+    auto buildWire = [](const std::vector<gp_Pnt>& pts) -> TopoDS_Wire {
+        BRepBuilderAPI_MakeWire wb;
         TopoDS_Vertex lastV;
-        for (int i = 0; i < nPts - 1; i++) {
-            TopoDS_Vertex v1 = (i == 0) ? BRepBuilderAPI_MakeVertex(topPts[i]) : lastV;
-            TopoDS_Vertex v2 = BRepBuilderAPI_MakeVertex(topPts[i + 1]);
-            topWireBuilder.Add(BRepBuilderAPI_MakeEdge(v1, v2));
+        int n = static_cast<int>(pts.size());
+        for (int i = 0; i < n - 1; i++) {
+            TopoDS_Vertex v1 = (i == 0) ? BRepBuilderAPI_MakeVertex(pts[i]) : lastV;
+            TopoDS_Vertex v2 = BRepBuilderAPI_MakeVertex(pts[i + 1]);
+            wb.Add(BRepBuilderAPI_MakeEdge(v1, v2));
             lastV = v2;
         }
-        double gap = topPts.back().Distance(topPts[0]);
-        if (gap > 1e-7) {
-            TopoDS_Vertex firstV = BRepBuilderAPI_MakeVertex(topPts[0]);
-            topWireBuilder.Add(BRepBuilderAPI_MakeEdge(lastV, firstV));
+        wb.Add(BRepBuilderAPI_MakeEdge(lastV, BRepBuilderAPI_MakeVertex(pts[0])));
+        wb.Build();
+        return wb.Wire();
+    };
+
+    // Compute approximate signed area to diagnose wire winding
+    auto windingSign = [](const std::vector<gp_Pnt>& pts) -> double {
+        double area = 0.0;
+        int n = static_cast<int>(pts.size());
+        for (int i = 0; i < n; i++) {
+            int j = (i + 1) % n;
+            area += pts[i].X() * pts[j].Y() - pts[j].X() * pts[i].Y();
         }
-        topWireBuilder.Build();
-    }
-    if (!topWireBuilder.IsDone()) { printf("  [occ] buildEmboss: topWire failed\n"); return -1; }
-    TopoDS_Wire topWire = topWireBuilder.Wire();
-    printf("  [occ] buildEmboss: topWire OK\n");
+        return area;
+    };
+
+    // Ensure CCW winding for face creation (wire reversed copy, originals kept for side tris)
+    auto makeCCWCopy = [&](const std::vector<gp_Pnt>& pts) -> std::vector<gp_Pnt> {
+        std::vector<gp_Pnt> c = pts;
+        double ws = windingSign(pts);
+        if (ws < 0) {
+            std::reverse(c.begin(), c.end());
+            printf("  [occ] buildEmboss: reversed wire (winding=%.3f → CCW)\n", ws);
+        }
+        return c;
+    };
 
     step = "4 bottomFace";
-    gp_Cylinder cylR(gp_Ax3(gp::Origin(), gp::DZ()), radius);
-    BRepBuilderAPI_MakeFace bfb(cylR, bottomWire);
-    bfb.Build();
-    if (!bfb.IsDone()) { printf("  [occ] buildEmboss: bottomFace failed\n"); return -1; }
-    TopoDS_Face bottomFace = bfb.Face();
-    printf("  [occ] buildEmboss: bottomFace OK\n");
+    {
+        auto ccwPts = makeCCWCopy(bottomPts);
+        BRepBuilderAPI_MakeFace fb(buildWire(ccwPts), true);
+        fb.Build();
+        if (!fb.IsDone()) { printf("  [occ] buildEmboss: bottomFace Build failed\n"); return -1; }
+        bottomFace = fb.Face();
+        BRepCheck_Analyzer chk(bottomFace);
+        printf("  [occ] buildEmboss: bottomFace valid=%d\n", (int)chk.IsValid());
+        g_lastBottomFaceH = static_cast<int>(g_shapeRegistry.size());
+        g_shapeRegistry.push_back(bottomFace);
+    }
 
     step = "5 topFace";
-    gp_Cylinder cylRp(gp_Ax3(gp::Origin(), gp::DZ()), radius + offset);
-    BRepBuilderAPI_MakeFace tfb(cylRp, topWire);
-    tfb.Build();
-    if (!tfb.IsDone()) { printf("  [occ] buildEmboss: topFace failed\n"); return -1; }
-    TopoDS_Face topFace = tfb.Face();
-    printf("  [occ] buildEmboss: topFace OK\n");
+    {
+        auto ccwPts = makeCCWCopy(topPts);
+        BRepBuilderAPI_MakeFace fb(buildWire(ccwPts), true);
+        fb.Build();
+        if (!fb.IsDone()) { printf("  [occ] buildEmboss: topFace Build failed\n"); return -1; }
+        topFace = fb.Face();
+        BRepCheck_Analyzer chk(topFace);
+        printf("  [occ] buildEmboss: topFace valid=%d\n", (int)chk.IsValid());
+        g_lastTopFaceH = static_cast<int>(g_shapeRegistry.size());
+        g_shapeRegistry.push_back(topFace);
+    }
 
     step = "6 sideFaces";
     BRepBuilderAPI_Sewing sewer(0.01);
@@ -977,5 +1109,588 @@ int occBuildEmboss(int wireHandle, double radius, double offset, int samplesPerE
     } catch (...) {
         printf("  [occ] buildEmboss: unknown exception at [%s]\n", step);
         return -1;
+    }
+}
+
+// ============================================================
+// Face splitting via BRepFeat_SplitShape — Phase 8
+// ============================================================
+//
+// Pipeline:
+//   1. occMakeWireFromUVCurves → TopoDS_Wire with Geom2d_BezierCurve edges on surface
+//   2. occSplitFaceByWire → BRepFeat_SplitShape splits cylinder face
+//   3. occGetSplitFaces → individual sub-face handles for rendering
+//
+// Edges are built via BRepBuilderAPI_MakeEdge(curve2d, surface) — the 3D
+// geometry equals surface(curve2D(t)), so edges truly lie on the surface.
+
+int occMakeWireFromUVCurves(emscripten::val uvData, int shapeHandle, int faceIndex, bool closeWire) {
+    const char* step = "init";
+    try {
+    if (shapeHandle < 0 || shapeHandle >= static_cast<int>(g_shapeRegistry.size())) {
+        printf("  [occ] makeWireFromUVCurves: invalid shapeHandle=%d\n", shapeHandle);
+        return -1;
+    }
+
+    step = "get shape";
+    TopoDS_Shape shape = g_shapeRegistry[shapeHandle];
+
+    // Find target face and extract its surface
+    TopExp_Explorer ex;
+    int idx = 0;
+    TopoDS_Face targetFace;
+    for (ex.Init(shape, TopAbs_FACE); ex.More(); ex.Next(), idx++) {
+        if (idx == faceIndex) {
+            targetFace = TopoDS::Face(ex.Current());
+            break;
+        }
+    }
+    if (targetFace.IsNull()) {
+        printf("  [occ] makeWireFromUVCurves: faceIndex=%d not found\n", faceIndex);
+        return -1;
+    }
+    step = "get surface";
+    Handle(Geom_Surface) surf = BRep_Tool::Surface(targetFace);
+    if (surf.IsNull()) {
+        printf("  [occ] makeWireFromUVCurves: surface is null\n");
+        return -1;
+    }
+
+    // Parse the Flat64Array header
+    int n = uvData["length"].as<int>();
+    if (n < 3) {
+        printf("  [occ] makeWireFromUVCurves: uvData too short (%d)\n", n);
+        return -1;
+    }
+    int numSegments = static_cast<int>(uvData[0].as<double>());
+    printf("  [occ] makeWireFromUVCurves: %d segments, surface type=%d\n",
+           numSegments, static_cast<int>(GeomAdaptor_Surface(surf).GetType()));
+
+    BRepBuilderAPI_MakeWire wireBuilder;
+    int offset = 1;
+    int segCount = 0;
+    gp_Pnt firstP3d;      // first edge's start 3D point
+    gp_Pnt prevEndP3d;    // previous edge's end 3D point
+    bool hasFirst = false;
+
+    for (int si = 0; si < numSegments; si++) {
+        step = "parse header";
+        if (offset + 1 >= n) break;
+        int segType = static_cast<int>(uvData[offset].as<double>());
+        int npts    = static_cast<int>(uvData[offset + 1].as<double>());
+        if (npts < 2 || npts > 25) {
+            printf("  [occ]   seg[%d] bad npts=%d\n", si, npts);
+            break;
+        }
+        if (offset + 1 + npts * 2 > n) {
+            printf("  [occ]   seg[%d] data overflow\n", si);
+            break;
+        }
+        offset += 2;
+
+        step = "read poles";
+        TColgp_Array1OfPnt2d poles(1, npts);
+        for (int k = 0; k < npts; k++) {
+            double u = uvData[offset + k * 2].as<double>();
+            double v = uvData[offset + k * 2 + 1].as<double>();
+            poles(k + 1) = gp_Pnt2d(u, v);
+        }
+        offset += npts * 2;
+
+        step = "create bezier";
+        Handle(Geom2d_BezierCurve) curve2d = new Geom2d_BezierCurve(poles);
+
+        step = "eval endpoints";
+        gp_Pnt2d uvS = curve2d->Value(0.0);
+        gp_Pnt2d uvE = curve2d->Value(1.0);
+        gp_Pnt pS, pE;
+        surf->D0(uvS.X(), uvS.Y(), pS);
+        surf->D0(uvE.X(), uvE.Y(), pE);
+
+        // Verify chord-line doesn't deviate too much from surface
+        if (si == 0) { firstP3d = pS; hasFirst = true; }
+        double chordLen = pS.Distance(pE);
+
+        step = "make edge";
+        TopoDS_Edge edge;
+        if (chordLen < 1e-9) {
+            printf("  [occ]   seg[%d] degenerate chord=%.3g, skipping\n", si, chordLen);
+            prevEndP3d = pE;
+            continue;
+        }
+        {
+            BRepBuilderAPI_MakeEdge edgeMaker(curve2d, surf);
+            if (edgeMaker.IsDone()) {
+                edge = edgeMaker.Edge();
+            } else {
+                // Fallback: 3D chord edge + pcurve override (so SplitShape sees a pcurve)
+                printf("  [occ]   seg[%d] curve-on-surface failed, fallback chord+pcurve\n", si);
+                edge = BRepBuilderAPI_MakeEdge(pS, pE);
+                Handle(Geom2d_Line) pcurve = new Geom2d_Line(
+                    uvS, gp_Dir2d(uvE.X() - uvS.X(), uvE.Y() - uvS.Y()));
+                BRep_Builder B;
+                B.UpdateEdge(edge, pcurve, surf, TopLoc_Location(), 1e-7);
+            }
+        }
+        prevEndP3d = pE;
+
+        step = "add wire";
+        wireBuilder.Add(edge);
+        prevEndP3d = pE;
+
+        segCount++;
+        const char* typeStr = (segType == 1) ? "line" : ((segType == 2) ? "quad" : "cubic");
+        printf("  [occ]   seg[%d] type=%s npts=%d u0=%.4f v0=%.4f uEnd=%.4f vEnd=%.4f p3d=(%.3f,%.3f,%.3f)→(%.3f,%.3f,%.3f)\n",
+               si, typeStr, npts,
+               poles(1).X(), poles(1).Y(), poles(npts).X(), poles(npts).Y(),
+               pS.X(), pS.Y(), pS.Z(), pE.X(), pE.Y(), pE.Z());
+    }
+
+    step = "build wire";
+    wireBuilder.Build();
+    if (!wireBuilder.IsDone()) {
+        printf("  [occ] makeWireFromUVCurves: Build wire FAILED after %d edges\n", segCount);
+        return -1;
+    }
+
+    TopoDS_Wire wire = wireBuilder.Wire();
+
+    // Verify closure using our own 3D endpoint data (avoids BRep_Tool::Pnt on vertices)
+    double gap = hasFirst ? firstP3d.Distance(prevEndP3d) : 0;
+
+    int handle = static_cast<int>(g_wireRegistry.size());
+    g_wireRegistry.push_back(wire);
+
+    printf("  [occ] makeWireFromUVCurves: handle=%d edges=%d closed=%s gap=%.4g\n",
+           handle, segCount, gap < 1e-6 ? "yes" : "no", gap);
+    return handle;
+
+    } catch (const Standard_Failure& e) {
+        printf("  [occ] makeWireFromUVCurves: Standard_Failure at [%s]: %s\n", step, e.GetMessageString());
+        return -1;
+    } catch (...) {
+        printf("  [occ] makeWireFromUVCurves: unknown exception at [%s]\n", step);
+        return -1;
+    }
+}
+
+int occMakeFaceFromWire(int shapeHandle, int faceIndex, int wireHandle, emscripten::val holeWireHandles) {
+    const char* step = "init";
+    try {
+    if (shapeHandle < 0 || shapeHandle >= static_cast<int>(g_shapeRegistry.size())) {
+        printf("  [occ] makeFaceFromWire: invalid shapeHandle=%d\n", shapeHandle);
+        return -1;
+    }
+    if (wireHandle < 0 || wireHandle >= static_cast<int>(g_wireRegistry.size())) {
+        printf("  [occ] makeFaceFromWire: invalid wireHandle=%d\n", wireHandle);
+        return -1;
+    }
+
+    step = "get surface";
+    TopoDS_Shape shape = g_shapeRegistry[shapeHandle];
+    TopExp_Explorer ex;
+    int idx = 0;
+    TopoDS_Face targetFace;
+    for (ex.Init(shape, TopAbs_FACE); ex.More(); ex.Next(), idx++) {
+        if (idx == faceIndex) {
+            targetFace = TopoDS::Face(ex.Current());
+            break;
+        }
+    }
+    if (targetFace.IsNull()) {
+        printf("  [occ] makeFaceFromWire: faceIndex=%d not found\n", faceIndex);
+        return -1;
+    }
+    Handle(Geom_Surface) surf = BRep_Tool::Surface(targetFace);
+    TopoDS_Wire wire = g_wireRegistry[wireHandle];
+
+    printf("  [occ] makeFaceFromWire: surface type=%d\n",
+           static_cast<int>(GeomAdaptor_Surface(surf).GetType()));
+
+    // ---- Normalize outer wire winding: UV signed area > 0 = CCW ----
+    double outerArea = signedAreaUV(wire, surf);
+    const char* outerDir = (outerArea > 1e-12) ? "CCW" : ((outerArea < -1e-12) ? "CW" : "ZERO");
+    printf("  [occ] makeFaceFromWire: outer UV_signed_area=%.4g (%s)\n", outerArea, outerDir);
+
+    TopoDS_Wire outerFixed = wire;
+    if (outerArea < 0) {
+        outerFixed = TopoDS::Wire(wire.Reversed());
+        printf("  [occ] makeFaceFromWire: reversed outer wire (CW→CCW)\n");
+    }
+
+    step = "build face";
+    BRepBuilderAPI_MakeFace faceBuilder(surf, outerFixed, true);
+
+    // ---- Add hole wires (holes must be CW, i.e. UV signed area < 0) ----
+    int numHoles = holeWireHandles["length"].as<int>();
+    for (int i = 0; i < numHoles; i++) {
+        int holeH = holeWireHandles[i].as<int>();
+        if (holeH < 0 || holeH >= static_cast<int>(g_wireRegistry.size())) continue;
+
+        const TopoDS_Wire& holeWire = g_wireRegistry[holeH];
+        double holeArea = signedAreaUV(holeWire, surf);
+        const char* holeDir = (holeArea > 1e-12) ? "CCW" : ((holeArea < -1e-12) ? "CW" : "ZERO");
+        printf("  [occ]   hole[%d] UV_signed_area=%.4g (%s)\n", i, holeArea, holeDir);
+
+        TopoDS_Wire holeFixed = holeWire;
+        if (holeArea > 0) {
+            holeFixed = TopoDS::Wire(holeWire.Reversed());
+            printf("  [occ]   reversed hole[%d] (CCW→CW)\n", i);
+        }
+        faceBuilder.Add(holeFixed);
+    }
+
+    faceBuilder.Build();
+    if (!faceBuilder.IsDone()) {
+        printf("  [occ] makeFaceFromWire: Build FAILED\n");
+        return -1;
+    }
+
+    TopoDS_Face face = faceBuilder.Face();
+    BRepCheck_Analyzer chk(face);
+    printf("  [occ] makeFaceFromWire: valid=%d\n", (int)chk.IsValid());
+
+    int handle = static_cast<int>(g_shapeRegistry.size());
+    g_shapeRegistry.push_back(face);
+    printf("  [occ] makeFaceFromWire: handle=%d\n", handle);
+    return handle;
+
+    } catch (const Standard_Failure& e) {
+        printf("  [occ] makeFaceFromWire: Standard_Failure at [%s]: %s\n", step, e.GetMessageString());
+        return -1;
+    } catch (...) {
+        printf("  [occ] makeFaceFromWire: unknown exception at [%s]\n", step);
+        return -1;
+    }
+}
+
+int occSplitFaceByWire(int shapeHandle, int faceIndex, int wireHandle) {
+    const char* step = "init";
+    try {
+    if (shapeHandle < 0 || shapeHandle >= static_cast<int>(g_shapeRegistry.size())) {
+        printf("  [occ] splitFaceByWire: invalid shapeHandle=%d\n", shapeHandle);
+        return -1;
+    }
+    if (wireHandle < 0 || wireHandle >= static_cast<int>(g_wireRegistry.size())) {
+        printf("  [occ] splitFaceByWire: invalid wireHandle=%d\n", wireHandle);
+        return -1;
+    }
+
+    TopoDS_Shape shape = g_shapeRegistry[shapeHandle];
+    TopoDS_Wire   wire = g_wireRegistry[wireHandle];
+
+    // Find target face by index
+    TopExp_Explorer ex;
+    int idx = 0;
+    TopoDS_Face targetFace;
+    for (ex.Init(shape, TopAbs_FACE); ex.More(); ex.Next(), idx++) {
+        if (idx == faceIndex) {
+            targetFace = TopoDS::Face(ex.Current());
+            break;
+        }
+    }
+    if (targetFace.IsNull()) {
+        printf("  [occ] splitFaceByWire: faceIndex=%d not found (faceCount=%d)\n", faceIndex, idx);
+        return -1;
+    }
+
+    // Log target face info
+    {
+        Handle(Geom_Surface) surf = BRep_Tool::Surface(targetFace);
+        GeomAdaptor_Surface adapt(surf);
+        double uMin, uMax, vMin, vMax;
+        BRepTools::UVBounds(targetFace, uMin, uMax, vMin, vMax);
+        printf("  [occ] splitFaceByWire: target face[%d] type=%d UV=[%.3f,%.3f]x[%.3f,%.3f]\n",
+               faceIndex, static_cast<int>(adapt.GetType()), uMin, uMax, vMin, vMax);
+    }
+
+    // Perform the split
+    step = "splitter init";
+    BRepFeat_SplitShape splitter(shape);
+    step = "splitter add";
+    splitter.Add(wire, targetFace);
+    step = "splitter build";
+    splitter.Build();
+
+    if (!splitter.IsDone()) {
+        printf("  [occ] splitFaceByWire: BRepFeat_SplitShape::Build() FAILED\n");
+        return -1;
+    }
+
+    TopoDS_Shape result = splitter.Shape();
+    if (result.IsNull()) {
+        printf("  [occ] splitFaceByWire: result shape is null\n");
+        return -1;
+    }
+
+    // Validate
+    BRepCheck_Analyzer chk(result);
+    printf("  [occ] splitFaceByWire: result valid=%d\n", (int)chk.IsValid());
+
+    // Store result shape
+    int resultHandle = static_cast<int>(g_shapeRegistry.size());
+    g_shapeRegistry.push_back(result);
+
+    // Extract modified sub-faces
+    const TopTools_ListOfShape& modified = splitter.Modified(targetFace);
+    printf("  [occ] splitFaceByWire: Modified(targetFace) -> %d sub-faces\n", modified.Size());
+
+    g_splitFaceHandles.clear();
+    int subIdx = 0;
+    for (TopTools_ListIteratorOfListOfShape it(modified); it.More(); it.Next(), subIdx++) {
+        const TopoDS_Face& subFace = TopoDS::Face(it.Value());
+        int h = static_cast<int>(g_shapeRegistry.size());
+        g_shapeRegistry.push_back(subFace);
+        g_splitFaceHandles.push_back(h);
+
+        Handle(Geom_Surface) subSurf = BRep_Tool::Surface(subFace);
+        GeomAdaptor_Surface subAdapt(subSurf);
+        double uMin, uMax, vMin, vMax;
+        BRepTools::UVBounds(subFace, uMin, uMax, vMin, vMax);
+        printf("  [occ]   sub-face[%d] handle=%d type=%d UV=[%.3f,%.3f]x[%.3f,%.3f]\n",
+               subIdx, h, static_cast<int>(subAdapt.GetType()),
+               uMin, uMax, vMin, vMax);
+    }
+
+    // Log Left/Right classification
+    const TopTools_ListOfShape& leftFaces  = splitter.Left();
+    const TopTools_ListOfShape& rightFaces = splitter.Right();
+    printf("  [occ] splitFaceByWire: Left()=%d faces, Right()=%d faces\n",
+           leftFaces.Size(), rightFaces.Size());
+
+    printf("  [occ] splitFaceByWire: OK resultHandle=%d subFaces=%d\n",
+           resultHandle, static_cast<int>(g_splitFaceHandles.size()));
+    return resultHandle;
+
+    } catch (const Standard_Failure& e) {
+        printf("  [occ] splitFaceByWire: Standard_Failure at [%s]: %s\n", step, e.GetMessageString());
+        return -1;
+    } catch (...) {
+        printf("  [occ] splitFaceByWire: unknown exception at [%s]\n", step);
+        return -1;
+    }
+}
+
+emscripten::val occGetSplitFaces() {
+    emscripten::val arr = emscripten::val::array();
+    for (int h : g_splitFaceHandles) {
+        arr.call<void>("push", h);
+    }
+    printf("  [occ] getSplitFaces: %d handles\n", static_cast<int>(g_splitFaceHandles.size()));
+    return arr;
+}
+
+// ============================================================
+// Nesting-depth face builder — Phase 9
+// ============================================================
+//
+// Uses BRepTopAdaptor_FClass2d to determine wire containment in UV space.
+// No winding assumptions — pure topological nesting.
+//
+// Algorithm:
+//   1. For each wire, compute UV bbox center as test point
+//   2. For each wire pair (i,j): test if i's center ∈ j using FClass2d on a temp face
+//   3. Build containment matrix → nesting depth
+//   4. depth 0,2,4,... = outer boundary → creates a Face
+//   5. depth 1,3,5,... = hole → assigned to its parent outer (depth-1)
+
+emscripten::val occBuildFacesFromWires(emscripten::val wireHandles, int shapeHandle, int faceIndex) {
+    const char* step = "init";
+    try {
+    int nWires = wireHandles["length"].as<int>();
+    if (nWires < 1) return emscripten::val::array();
+    if (shapeHandle < 0 || shapeHandle >= static_cast<int>(g_shapeRegistry.size())) {
+        printf("  [occ] buildFacesFromWires: invalid shapeHandle=%d\n", shapeHandle);
+        return emscripten::val::array();
+    }
+
+    step = "get surface";
+    TopoDS_Shape shape = g_shapeRegistry[shapeHandle];
+    TopExp_Explorer ex;
+    TopoDS_Face targetFace;
+    int idx = 0;
+    for (ex.Init(shape, TopAbs_FACE); ex.More(); ex.Next(), idx++) {
+        if (idx == faceIndex) { targetFace = TopoDS::Face(ex.Current()); break; }
+    }
+    if (targetFace.IsNull()) {
+        printf("  [occ] buildFacesFromWires: face not found\n");
+        return emscripten::val::array();
+    }
+    Handle(Geom_Surface) surf = BRep_Tool::Surface(targetFace);
+
+    // ---- 1. Collect wires, compute UV bbox + area, sort by area desc ----
+    struct WireData { TopoDS_Wire wire; double area; double uMin,uMax,vMin,vMax; int origIdx; };
+    std::vector<WireData> wdat;
+
+    for (int i = 0; i < nWires; i++) {
+        int wh = wireHandles[i].as<int>();
+        if (wh < 0 || wh >= static_cast<int>(g_wireRegistry.size())) continue;
+        double uMin=DBL_MAX, uMax=-DBL_MAX, vMin=DBL_MAX, vMax=-DBL_MAX;
+        TopExp_Explorer edEx;
+        for (edEx.Init(g_wireRegistry[wh], TopAbs_EDGE); edEx.More(); edEx.Next()) {
+            const TopoDS_Edge& edge = TopoDS::Edge(edEx.Current());
+            Standard_Real first, last;
+            Handle(Geom2d_Curve) pc = BRep_Tool::CurveOnSurface(edge, surf, TopLoc_Location(), first, last);
+            if (!pc.IsNull()) {
+                gp_Pnt2d uv = pc->Value(first);
+                if (uv.X()<uMin) uMin=uv.X(); if (uv.X()>uMax) uMax=uv.X();
+                if (uv.Y()<vMin) vMin=uv.Y(); if (uv.Y()>vMax) vMax=uv.Y();
+            }
+        }
+        double area = (uMax-uMin) * (vMax-vMin);
+        wdat.push_back({g_wireRegistry[wh], area, uMin,uMax,vMin,vMax, i});
+    }
+
+    // Sort by bbox area descending (largest first)
+    std::sort(wdat.begin(), wdat.end(),
+        [](const WireData& a, const WireData& b) { return a.area > b.area; });
+
+    int N = static_cast<int>(wdat.size());
+    printf("  [occ] buildFacesFromWires: %d wires, sorted by bbox area\n", N);
+    for (int i = 0; i < N; i++) {
+        printf("  [occ]   wire[%d] origIdx=%d area=%.4g bbox=[%.3f,%.3f]x[%.3f,%.3f]\n",
+               i, wdat[i].origIdx, wdat[i].area, wdat[i].uMin,wdat[i].uMax,wdat[i].vMin,wdat[i].vMax);
+    }
+
+    // ---- 2. Compute interior test points + build temp faces ----
+    // Interior point = pcurve midpoint + inward normal offset (epsilon)
+    std::vector<gp_Pnt2d> testPts(N);
+    std::vector<TopoDS_Face> tempFaces(N);
+    std::vector<bool> tempFaceValid(N, false);
+
+    for (int i = 0; i < N; i++) {
+        // Normalize winding for temp face
+        TopoDS_Wire wNorm = wdat[i].wire;
+        double uvArea = signedAreaUV(wNorm, surf);
+        if (uvArea < 0) wNorm = TopoDS::Wire(wdat[i].wire.Reversed());
+
+        step = "temp face";
+        BRepBuilderAPI_MakeFace mf(surf, wNorm, true);
+        if (mf.IsDone()) {
+            tempFaces[i] = mf.Face();
+            tempFaceValid[i] = true;
+        }
+
+        // Compute interior test point: first edge's pcurve midpoint + inward normal
+        step = "test point";
+        TopExp_Explorer edEx;
+        for (edEx.Init(wdat[i].wire, TopAbs_EDGE); edEx.More(); edEx.Next()) {
+            const TopoDS_Edge& edge = TopoDS::Edge(edEx.Current());
+            Standard_Real t0, t1;
+            Handle(Geom2d_Curve) pc = BRep_Tool::CurveOnSurface(edge, surf, TopLoc_Location(), t0, t1);
+            if (pc.IsNull()) continue;
+            double tMid = (t0 + t1) * 0.5;
+            gp_Pnt2d uvMid = pc->Value(tMid);
+            gp_Vec2d tangent = pc->DN(tMid, 1);
+            double eps = (t1 - t0) * 0.01; // 1% of edge param range
+            if (eps < 1e-6) eps = 1e-6;
+
+            // Two candidate normal directions
+            gp_Vec2d n1(-tangent.Y(), tangent.X());
+            gp_Vec2d n2( tangent.Y(), -tangent.X());
+            if (n1.Magnitude() < 1e-12) continue;
+            n1.Normalize(); n2.Normalize();
+            gp_Pnt2d cand1(uvMid.X() + n1.X() * eps, uvMid.Y() + n1.Y() * eps);
+            gp_Pnt2d cand2(uvMid.X() + n2.X() * eps, uvMid.Y() + n2.Y() * eps);
+
+            // Use FClass2d to pick the inward direction (IN = inside bounded region)
+            testPts[i] = cand1; // default
+            if (tempFaceValid[i]) {
+                BRepTopAdaptor_FClass2d cls(tempFaces[i], 1e-7);
+                if (cls.Perform(cand1) == TopAbs_IN) { testPts[i] = cand1; }
+                else if (cls.Perform(cand2) == TopAbs_IN) { testPts[i] = cand2; }
+                // If neither IN, fallback to cand1 (might be ON boundary or very small edge)
+            }
+            break; // first edge is enough
+        }
+        printf("  [occ]   wire[%d] testPt=(%.4f,%.4f) uvArea=%.4g\n",
+               i, testPts[i].X(), testPts[i].Y(), uvArea);
+    }
+
+    // ---- 3. Build containment tree via area-sorted FClass2d ----
+    // For each wire i, find its direct parent j (smallest j > i that contains it, i.e. smallest-area container)
+    std::vector<int> parent(N, -1); // parent[j] = index of containing wire
+    for (int i = 1; i < N; i++) { // start from index 1 (smaller wires)
+        for (int j = 0; j < i; j++) { // only test against LARGER wires (j < i)
+            if (!tempFaceValid[j]) continue;
+            // Bbox pre-filter
+            const auto& tp = testPts[i];
+            if (tp.X() < wdat[j].uMin - 1e-6 || tp.X() > wdat[j].uMax + 1e-6 ||
+                tp.Y() < wdat[j].vMin - 1e-6 || tp.Y() > wdat[j].vMax + 1e-6) continue;
+
+            BRepTopAdaptor_FClass2d cls(tempFaces[j], 1e-7);
+            if (cls.Perform(tp) == TopAbs_IN) {
+                parent[i] = j; // first (smallest-area) container wins = direct parent
+                break;
+            }
+        }
+    }
+
+    // ---- 4. Compute nesting depth from tree ----
+    std::vector<int> depth(N, -1);
+    std::function<int(int)> getDepth = [&](int i) -> int {
+        if (depth[i] >= 0) return depth[i];
+        if (parent[i] < 0) { depth[i] = 0; return 0; }
+        depth[i] = getDepth(parent[i]) + 1;
+        return depth[i];
+    };
+    for (int i = 0; i < N; i++) getDepth(i);
+
+    for (int i = 0; i < N; i++) {
+        printf("  [occ]   wire[%d] depth=%d %s parent=%d testPt=(%.4f,%.4f)\n",
+               i, depth[i], (depth[i] % 2 == 0) ? "OUTER" : "HOLE",
+               parent[i], testPts[i].X(), testPts[i].Y());
+    }
+
+    // ---- 5. Build faces: even depth = outer, odd depth holes → assigned to direct parent ----
+    emscripten::val result = emscripten::val::array();
+    for (int i = 0; i < N; i++) {
+        if (depth[i] % 2 != 0) continue; // hole, skip
+
+        // Normalize outer winding
+        TopoDS_Wire outerFixed = wdat[i].wire;
+        double outerUV = signedAreaUV(outerFixed, surf);
+        if (outerUV < 0) outerFixed = TopoDS::Wire(wdat[i].wire.Reversed());
+
+        // Collect direct holes: depth = depth[i]+1 AND parent = i
+        std::vector<int> holeIdx;
+        for (int h = 0; h < N; h++) {
+            if (depth[h] == depth[i] + 1 && parent[h] == i) {
+                holeIdx.push_back(h);
+            }
+        }
+
+        step = "build face";
+        BRepBuilderAPI_MakeFace faceBuilder(surf, outerFixed, true);
+        for (int hi : holeIdx) {
+            TopoDS_Wire holeFixed = wdat[hi].wire;
+            double holeUV = signedAreaUV(holeFixed, surf);
+            if (holeUV > 0) holeFixed = TopoDS::Wire(wdat[hi].wire.Reversed());
+            faceBuilder.Add(holeFixed);
+        }
+
+        faceBuilder.Build();
+        if (!faceBuilder.IsDone()) {
+            printf("  [occ]   outer[%d] MakeFace FAILED\n", i);
+            continue;
+        }
+        TopoDS_Face face = faceBuilder.Face();
+        BRepCheck_Analyzer chk(face);
+        int h = static_cast<int>(g_shapeRegistry.size());
+        g_shapeRegistry.push_back(face);
+        result.call<void>("push", h);
+        printf("  [occ]   outer[%d] → face[%d] holes=%d valid=%d\n",
+               i, h, (int)holeIdx.size(), (int)chk.IsValid());
+    }
+
+    printf("  [occ] buildFacesFromWires: %d faces\n", (int)result["length"].as<int>());
+    return result;
+
+    } catch (const Standard_Failure& e) {
+        printf("  [occ] buildFacesFromWires: Standard_Failure at [%s]: %s\n", step, e.GetMessageString());
+        return emscripten::val::array();
+    } catch (...) {
+        printf("  [occ] buildFacesFromWires: unknown exception at [%s]\n", step);
+        return emscripten::val::array();
     }
 }

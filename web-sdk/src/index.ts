@@ -407,3 +407,64 @@ export function buildEmboss(wireHandle: number, radius: number, offset: number, 
   if (!_m) throw new Error('Not initialized.');
   return _m.occBuildEmboss(wireHandle, radius, offset, samplesPerEdge);
 }
+
+export function getLastBottomFace(): number {
+  if (!_m) throw new Error('Not initialized.');
+  return _m.occGetLastBottomFace();
+}
+
+export function getLastTopFace(): number {
+  if (!_m) throw new Error('Not initialized.');
+  return _m.occGetLastTopFace();
+}
+
+// ============================================================
+// Phase 8: Face splitting via BRepFeat_SplitShape
+// ============================================================
+
+// Build a wire from analytic UV curve segments on a face's surface.
+// uvData: Float64Array — [numSegments, type0, npts0, u0,v0, ..., type1, npts1, ...]
+//   type=1 line(2pts)  type=2 quad(3pts)  type=3 cubic(4pts)
+// shapeHandle: shape whose face surface to use
+// faceIndex: which face to take the surface from
+// closeWire: if true, ensure wire is closed
+export function makeWireFromUVCurves(uvData: Float64Array, shapeHandle: number, faceIndex: number, closeWire: boolean): number {
+  if (!_m) throw new Error('Not initialized.');
+  return _m.occMakeWireFromUVCurves(uvData, shapeHandle, faceIndex, closeWire);
+}
+
+// Split a face of a shape using a wire that lies on that face.
+// Returns new shape handle (the whole shape with the split), or -1.
+export function splitFaceByWire(shapeHandle: number, faceIndex: number, wireHandle: number): number {
+  if (!_m) throw new Error('Not initialized.');
+  return _m.occSplitFaceByWire(shapeHandle, faceIndex, wireHandle);
+}
+
+// Get sub-face handles from the last splitFaceByWire call.
+export function getSplitFaces(): number[] {
+  if (!_m) throw new Error('Not initialized.');
+  const arr = _m.occGetSplitFaces();
+  const n = arr.length;
+  const out: number[] = new Array(n);
+  for (let i = 0; i < n; i++) out[i] = arr[i];
+  return out;
+}
+
+// Create a trimmed face from surface + wire (no split, pure MakeFace).
+// Uses the surface from shapeHandle/faceIndex and the wire from wireHandle.
+// The face belongs to the original surface (same Geom_Surface).
+export function makeFaceFromWire(shapeHandle: number, faceIndex: number, wireHandle: number, holeWireHandles: number[]): number {
+  if (!_m) throw new Error('Not initialized.');
+  return _m.occMakeFaceFromWire(shapeHandle, faceIndex, wireHandle, holeWireHandles);
+}
+
+// Build faces from all wires using nesting-depth classification.
+// Returns array of face handles (each face already has its holes).
+export function buildFacesFromWires(wireHandles: number[], shapeHandle: number, faceIndex: number): number[] {
+  if (!_m) throw new Error('Not initialized.');
+  const arr = _m.occBuildFacesFromWires(wireHandles, shapeHandle, faceIndex);
+  const n = arr.length;
+  const out: number[] = new Array(n);
+  for (let i = 0; i < n; i++) out[i] = arr[i];
+  return out;
+}

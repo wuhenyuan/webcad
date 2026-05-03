@@ -3,9 +3,10 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import * as opentype from 'opentype.js';
 import {
   init,
-  createCylinderShape, getFaceInfo, evalFaceUV, occMakeCylinder,
-  makeWireFromPoints, getWireInfo, sampleWire3D, releaseWireHandle,
-  buildEmboss, tessellateShape, getTopologyInfo,
+  createCylinderShape, getFaceInfo, occMakeCylinder,
+  getWireInfo, sampleWire3D, releaseWireHandle,
+  makeWireFromUVCurves, buildFacesFromWires,
+  tessellateShape, tessellateFaceMesh, getTopologyInfo,
   releaseShapeHandle,
   OccWireInfoData, OccTopologyInfoData, SURFACE_TYPE_NAMES,
 } from 'webcad-sdk';
@@ -50,109 +51,113 @@ const CYL_RADIUS = 1.0;
 const CYL_HEIGHT = 2.2;
 
 // ============================================================
-// Bezier flattening
+// Glyph → UV analytic curves
 // ============================================================
-function flattenCubic(
-  x0: number, y0: number, x1: number, y1: number,
-  x2: number, y2: number, x3: number, y3: number,
-  tol: number, out: number[][],
-) {
-  const mcx = (x0 + x3) * 0.5, mcy = (y0 + y3) * 0.5;
-  const bpx = (x0 + 3 * x1 + 3 * x2 + x3) * 0.125;
-  const bpy = (y0 + 3 * y1 + 3 * y2 + y3) * 0.125;
-  if (Math.hypot(bpx - mcx, bpy - mcy) < tol) { out.push([x3, y3]); return; }
-  const x01 = (x0 + x1) * 0.5, y01 = (y0 + y1) * 0.5;
-  const x12 = (x1 + x2) * 0.5, y12 = (y1 + y2) * 0.5;
-  const x23 = (x2 + x3) * 0.5, y23 = (y2 + y3) * 0.5;
-  const x012 = (x01 + x12) * 0.5, y012 = (y01 + y12) * 0.5;
-  const x123 = (x12 + x23) * 0.5, y123 = (y12 + y23) * 0.5;
-  const x0123 = (x012 + x123) * 0.5, y0123 = (y012 + y123) * 0.5;
-  flattenCubic(x0, y0, x01, y01, x012, y012, x0123, y0123, tol, out);
-  flattenCubic(x0123, y0123, x123, y123, x23, y23, x3, y3, tol, out);
-}
+// Maps glyph bezier control points to UV space via affine transform:
+//   u = uStart + (gx / 72) * uvScale
+//   v = offsetV + (gy / 72) * uvScale
+// Returns one Float64Array per contour:
+//   [numSegments, type0, npts0, u0,v0, ..., type1, npts1, ...]
+//   type=1 line(2pts)  type=2 quad(3pts)  type=3 cubic(4pts)
+function glyphToUVCurves(
+  glyph: opentype.Glyph, x: number, y: number, fontSize: number,
+  uStart: number, uvScale: number, offsetV: number,
+): Float64Array[] {
+  const toUV = (gx: number, gy: number): [number, number] => [
+    uStart + (gx / 72) * uvScale,
+    offsetV + (gy / 72) * uvScale,
+  ];
 
-function flattenQuad(
-  x0: number, y0: number, x1: number, y1: number,
-  x2: number, y2: number, tol: number, out: number[][],
-) {
-  const mcx = (x0 + x2) * 0.5, mcy = (y0 + y2) * 0.5;
-  const bpx = (x0 + 2 * x1 + x2) * 0.25, bpy = (y0 + 2 * y1 + y2) * 0.25;
-  if (Math.hypot(bpx - mcx, bpy - mcy) < tol) { out.push([x2, y2]); return; }
-  const x01 = (x0 + x1) * 0.5, y01 = (y0 + y1) * 0.5;
-  const x12 = (x1 + x2) * 0.5, y12 = (y1 + y2) * 0.5;
-  const x012 = (x01 + x12) * 0.5, y012 = (y01 + y12) * 0.5;
-  flattenQuad(x0, y0, x01, y01, x012, y012, tol, out);
-  flattenQuad(x012, y012, x12, y12, x2, y2, tol, out);
-}
-
-function glyphToPolylines(glyph: opentype.Glyph, x: number, y: number, fontSize: number): number[][][] {
   const path = glyph.getPath(x, y, fontSize);
-  const contours: number[][][] = [];
+  const contours: number[][][] = []; // each contour = array of [type, npts, u0,v0,...]
   let current: number[][] = [];
   let cx = 0, cy = 0;
+  let startU = 0, startV = 0;
+
   for (const cmd of path.commands) {
     switch (cmd.type) {
       case 'M':
         if (current.length > 0) contours.push(current);
-        current = [[cmd.x, cmd.y]];
+        current = [];
+        [startU, startV] = toUV(cmd.x, cmd.y);
         cx = cmd.x; cy = cmd.y;
         break;
-      case 'L':
-        current.push([cmd.x, cmd.y]);
+      case 'L': {
+        const [u0, v0] = toUV(cx, cy);
+        const [u1, v1] = toUV(cmd.x, cmd.y);
+        current.push([1, 2, u0, v0, u1, v1]);
         cx = cmd.x; cy = cmd.y;
         break;
-      case 'Q':
-        flattenQuad(cx, cy, cmd.x1, cmd.y1, cmd.x, cmd.y, 0.3, current);
+      }
+      case 'Q': {
+        const [u0, v0] = toUV(cx, cy);
+        const [u1, v1] = toUV(cmd.x1, cmd.y1);
+        const [u2, v2] = toUV(cmd.x, cmd.y);
+        current.push([2, 3, u0, v0, u1, v1, u2, v2]);
         cx = cmd.x; cy = cmd.y;
         break;
-      case 'C':
-        flattenCubic(cx, cy, cmd.x1, cmd.y1, cmd.x2, cmd.y2, cmd.x, cmd.y, 0.3, current);
+      }
+      case 'C': {
+        const [u0, v0] = toUV(cx, cy);
+        const [u1, v1] = toUV(cmd.x1, cmd.y1);
+        const [u2, v2] = toUV(cmd.x2, cmd.y2);
+        const [u3, v3] = toUV(cmd.x, cmd.y);
+        current.push([3, 4, u0, v0, u1, v1, u2, v2, u3, v3]);
         cx = cmd.x; cy = cmd.y;
         break;
-      case 'Z':
+      }
+      case 'Z': {
         if (current.length > 0) {
-          const first = current[0];
-          current.push([first[0], first[1]]);
+          const [u0, v0] = toUV(cx, cy);
+          // Avoid degenerate closing segment
+          const du = u0 - startU, dv = v0 - startV;
+          if (Math.hypot(du, dv) > 1e-9) {
+            current.push([1, 2, u0, v0, startU, startV]);
+          }
         }
         break;
+      }
     }
   }
   if (current.length > 0) contours.push(current);
-  return contours;
-}
 
-// ============================================================
-// Glyph UV → 3D on cylinder surface
-// ============================================================
-function contourTo3D(cylHandle: number, fi: number, contour: number[][], uStart: number): Float64Array {
-  const n = contour.length;
-  const pts = new Float64Array(n * 3);
-  for (let i = 0; i < n; i++) {
-    const [gx, gy] = contour[i];
-    const u = uStart + (gx / 72) * state.uvScale;
-    const v = state.offsetV + (gy / 72) * state.uvScale;
-    const p = evalFaceUV(cylHandle, fi, u, v);
-    pts[i * 3]     = p.x;
-    pts[i * 3 + 1] = p.y;
-    pts[i * 3 + 2] = p.z;
-  }
-  return pts;
+  // Filter out degenerate segments (chord ~0 in UV space)
+  // and encode each contour: [numSegments, type0, npts0, u0,v0, ..., type1, npts1, ...]
+  return contours
+    .map(segs => {
+      const valid = segs.filter(s => {
+        const npts = s[1];
+        const u0 = s[2], v0 = s[3], uE = s[2 + (npts - 1) * 2], vE = s[3 + (npts - 1) * 2];
+        return Math.hypot(uE - u0, vE - v0) > 1e-9;
+      });
+      if (valid.length === 0) return null;
+      const flat: number[] = [valid.length];
+      for (const s of valid) flat.push(...s);
+      return new Float64Array(flat);
+    })
+    .filter(a => a !== null) as Float64Array[];
 }
 
 // ============================================================
 // Three.js helpers
 // ============================================================
-function createMesh(pos: Float32Array, nor: Float32Array, idx: Uint32Array, color: number, opacity: number, wireframe: boolean): THREE.Mesh {
+function createMesh(pos: Float32Array, nor: Float32Array, idx: Uint32Array, color: number, opacity: number, wireframe: boolean, polyOffset = false): THREE.Mesh {
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   geo.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
   geo.setIndex(new THREE.BufferAttribute(idx, 1));
-  return new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
+  const mat = new THREE.MeshStandardMaterial({
     color, roughness: 0.4, metalness: 0.05,
     side: THREE.DoubleSide,
     transparent: true, opacity,
     wireframe,
-  }));
+  });
+  if (polyOffset) {
+    mat.polygonOffset = true;
+    mat.polygonOffsetFactor = -1;
+    mat.polygonOffsetUnits = -1;
+  }
+  return new THREE.Mesh(geo, mat);
 }
 
 // ============================================================
@@ -184,62 +189,56 @@ function rebuildAll(cylHandle: number, fi: number, font: opentype.Font) {
   const SOLID_COLOR = 0xeeaa44;
 
   console.log(`\n${'═'.repeat(60)}`);
-  console.log(`Surface Emboss: Wire → Sample → Offset → Sew → Solid  "${state.text}"`);
+  console.log(`Face Split: Wire(pcurve) → BRepFeat_SplitShape  "${state.text}"`);
   console.log(`${'═'.repeat(60)}`);
 
   for (const ch of state.text) {
     const glyph = font.charToGlyph(ch);
     if (!glyph || !glyph.path) continue;
 
-    const contours = glyphToPolylines(glyph, cursorX, 0, fontSize);
     const uStart = state.offsetU;
+    const uvCurves = glyphToUVCurves(glyph, cursorX, 0, fontSize, uStart, state.uvScale, state.offsetV);
 
-    let outerWireH = -1;
-    const holeWireH: number[] = [];
+    // Build wires for all contours
+    const charWireHandles: number[] = [];
+    uvCurves.forEach((uvData, ci) => {
+      const segCount = uvData[0];
+      if (segCount < 1) return;
+      console.log(`  glyph '${ch}' contour[${ci}]: ${segCount} UV curve segments`);
 
-    contours.forEach((contour, ci) => {
-      if (contour.length < 3) return;
-
-      const pts3D = contourTo3D(cylHandle, fi, contour, uStart);
-      const wireH = makeWireFromPoints(pts3D, true);
+      const wireH = makeWireFromUVCurves(uvData, cylHandle, 0, true);
       if (wireH < 0) return;
       wireHandles.push(wireH);
+      charWireHandles.push(wireH);
 
       const info = getWireInfo(wireH);
-      const isOuter = ci === 0;
-      const kind = isOuter ? 'outer' : 'hole';
-      const color = isOuter ? OUTER_COLOR : HOLE_COLOR;
-      console.log(`  Wire[${wireH}] '${ch}' ${kind}: edges=${info.edgeCount} closed=${info.isClosed} len=${info.totalLength.toFixed(3)}`);
-
-      // Visualize wire
+      const color = (ci === 0) ? OUTER_COLOR : HOLE_COLOR;
+      console.log(`  Wire[${wireH}] '${ch}' c${ci}: edges=${info.edgeCount} closed=${info.isClosed}`);
       drawWire(wireH, color, 2);
-
-      if (isOuter) {
-        outerWireH = wireH;
-      } else {
-        holeWireH.push(wireH);
-      }
     });
 
-    if (outerWireH < 0) continue;
+    if (charWireHandles.length === 0) continue;
 
-    // ---- Build emboss solid (wire → face → offset → sew → solid) ----
-    const solidH = buildEmboss(outerWireH, CYL_RADIUS, state.embossDepth, /*samplesPerEdge=*/ 6);
-    if (solidH < 0) {
-      console.log(`  FAILED to build emboss for '${ch}'`);
-      continue;
-    }
-    shapeHandles.push(solidH);
+    // ---- Nesting-depth face builder: all wires → all faces ----
+    const faceHandles = buildFacesFromWires(charWireHandles, cylHandle, 0);
+    console.log(`  '${ch}': ${charWireHandles.length} wires → ${faceHandles.length} faces`);
 
-    const solidTopo = getTopologyInfo(solidH);
-    console.log(`  Solid[${solidH}] '${ch}': S=${solidTopo.numSolids} Sh=${solidTopo.numShells} F=${solidTopo.numFaces} E=${solidTopo.numEdges}`);
+    const FACE_COLORS = [0x00e5ff, 0x44ffaa, 0xffaa44, 0xff44aa, 0xaadd44];
+    faceHandles.forEach((fh, fi) => {
+      shapeHandles.push(fh);
 
-    // Tessellate + render solid
-    const solidMesh = tessellateShape(solidH, state.deflection);
-    dyn.add(createMesh(solidMesh.positions, solidMesh.normals, solidMesh.indices, SOLID_COLOR, 0.85, false));
+      const faceInfo = getFaceInfo(fh, 0);
+      const typeName = SURFACE_TYPE_NAMES[faceInfo.surfaceType] ?? '?';
+      const onCyl = faceInfo.surfaceType === 1;
+      console.log(`  Face[${fh}] '${ch}': ${typeName} UV=[${faceInfo.uMin.toFixed(3)},${faceInfo.uMax.toFixed(3)}]x[${faceInfo.vMin.toFixed(3)},${faceInfo.vMax.toFixed(3)}] ${onCyl ? 'OK' : 'WARN'}`);
 
-    // Wireframe overlay on solid
-    dyn.add(createMesh(solidMesh.positions, solidMesh.normals, solidMesh.indices, 0x221100, 0.12, true));
+      const fm = tessellateFaceMesh(fh, 0, state.deflection);
+      if (fm.positions.length > 0) {
+        const color = FACE_COLORS[fi % FACE_COLORS.length];
+        dyn.add(createMesh(fm.positions, fm.normals, fm.indices, color, 0.8, false, true));
+        dyn.add(createMesh(fm.positions, fm.normals, fm.indices, 0x003344, 0.15, true, true));
+      }
+    });
 
     const adv = (glyph.advanceWidth ?? 0) / (font.unitsPerEm || 1000) * fontSize;
     cursorX += adv + state.letterSpacing;
@@ -276,7 +275,7 @@ function createPanel(cylHandle: number, fi: number, font: opentype.Font, onChang
   `;
 
   const title = document.createElement('div');
-  title.textContent = 'Surface Emboss';
+  title.textContent = 'Face Split (BRepFeat)';
   title.style.cssText = 'color:#fff; font-weight:bold; margin-bottom:12px; font-size:14px;';
   div.appendChild(title);
 
@@ -351,10 +350,11 @@ function addHelp() {
     font:11px monospace; line-height:1.7; pointer-events:none; z-index:10;
   `;
   div.innerHTML = `
-    <span style="color:#00e5ff">━━</span> outer wire &nbsp;
+    <span style="color:#00e5ff">━━</span> cylinder wire (pcurve) &nbsp;
     <span style="color:#ff6e40">━━</span> hole wire<br>
-    <span style="color:#eeaa44">■</span> emboss solid<br>
-    glyph → UV→3D → Wire → Sample → Normal Offset → Sew → Solid
+    <span style="color:#44aaff">■</span> text region &nbsp;
+    <span style="color:#ff8844">■</span> rest of cylinder<br>
+    glyph → UV→3D → CylWire(pcurve) → BRepFeat_SplitShape → sub-faces
   `;
   document.body.appendChild(div);
 }
@@ -368,19 +368,17 @@ async function main() {
   console.timeEnd('init');
 
   console.log('╔══════════════════════════════════════╗');
-  console.log('║  Surface Emboss: Manual Normal Off. ║');
+  console.log('║  Face Split: BRepFeat_SplitShape    ║');
   console.log('╚══════════════════════════════════════╝');
   console.log('');
   console.log('Pipeline:');
-  console.log('  1. opentype.js → glyph bezier → flattened polyline');
-  console.log('  2. UV → Geom_Surface::D1 → 3D points on cylinder');
-  console.log('  3. BRepBuilderAPI_MakeWire → TopoDS_Wire on cylinder surface');
-  console.log('  4. Sample wire points → offset along cylinder normals');
-  console.log('  5. BRepBuilderAPI_MakeFace(gp_Cylinder, wire) → bot/top faces');
-  console.log('  6. Triangle side faces + BRepBuilderAPI_Sewing → shell');
-  console.log('  7. BRepBuilderAPI_MakeSolid → closed solid');
-  console.log('  8. BRepMesh_IncrementalMesh → tessellation');
-  console.log('  9. Three.js rendering');
+  console.log('  1. opentype.js → glyph bezier → UV analytic curves');
+  console.log('  2. Geom2d_BezierCurve → BRepBuilderAPI_MakeEdge(curve2d, surface)');
+  console.log('  3. BRepBuilderAPI_MakeWire → TopoDS_Wire (edges truly on surface)');
+  console.log('  4. BRepFeat_SplitShape → split cylinder face');
+  console.log('  5. Sub-faces retain original Geom_CylindricalSurface');
+  console.log('  6. BRepMesh_IncrementalMesh → tessellation');
+  console.log('  7. Three.js rendering');
   console.log('');
 
   // Load font
