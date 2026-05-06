@@ -46,6 +46,7 @@ const state = {
   solidThickness: 0.08,
   letterSpacing: 0.0,
   deflection: 0.05,
+  angle: 0,
 };
 
 // Cylinder params
@@ -55,22 +56,30 @@ const CYL_HEIGHT = 2.2;
 // ============================================================
 // Glyph → UV analytic curves
 // ============================================================
-// Maps glyph bezier control points to UV space via affine transform:
-//   u = uStart + (gx / 72) * uvScale
-//   v = offsetV + (gy / 72) * uvScale
+// Maps glyph bezier control points to UV space via affine transform + rotation:
+//   du = (gx / 72) * uvScale,  dv = (gy / 72) * uvScale
+//   u = uStart + cursorU + du*cosθ - dv*sinθ
+//   v = offsetV + cursorV + du*sinθ + dv*cosθ
 // Returns one Float64Array per contour:
 //   [numSegments, type0, npts0, u0,v0, ..., type1, npts1, ...]
 //   type=1 line(2pts)  type=2 quad(3pts)  type=3 cubic(4pts)
 function glyphToUVCurves(
-  glyph: opentype.Glyph, x: number, y: number, fontSize: number,
+  glyph: opentype.Glyph, fontSize: number,
   uStart: number, uvScale: number, offsetV: number,
+  angleDeg: number, cursorU: number, cursorV: number,
 ): Float64Array[] {
-  const toUV = (gx: number, gy: number): [number, number] => [
-    uStart + (gx / 72) * uvScale,
-    offsetV + (gy / 72) * uvScale,
-  ];
+  const rad = angleDeg * Math.PI / 180;
+  const cosA = Math.cos(rad), sinA = Math.sin(rad);
+  const toUV = (gx: number, gy: number): [number, number] => {
+    const du = (gx / 72) * uvScale;
+    const dv = (gy / 72) * uvScale;
+    return [
+      uStart + cursorU + du * cosA - dv * sinA,
+      offsetV + cursorV + du * sinA + dv * cosA,
+    ];
+  };
 
-  const path = glyph.getPath(x, y, fontSize);
+  const path = glyph.getPath(0, 0, fontSize);
   const contours: number[][][] = []; // each contour = array of [type, npts, u0,v0,...]
   let current: number[][] = [];
   let cx = 0, cy = 0;
@@ -184,7 +193,9 @@ function rebuildAll(cylHandle: number, fi: number, font: opentype.Font) {
   cleanup();
 
   const fontSize = 72;
-  let cursorX = 0;
+  const rad = state.angle * Math.PI / 180;
+  const cosA = Math.cos(rad), sinA = Math.sin(rad);
+  let cursorU = 0, cursorV = 0;
 
   const OUTER_COLOR = 0x00e5ff;
   const HOLE_COLOR  = 0xff6e40;
@@ -200,7 +211,7 @@ function rebuildAll(cylHandle: number, fi: number, font: opentype.Font) {
     if (!glyph || !glyph.path) continue;
 
     const uStart = state.offsetU;
-    const uvCurves = glyphToUVCurves(glyph, cursorX, 0, fontSize, uStart, state.uvScale, state.offsetV);
+    const uvCurves = glyphToUVCurves(glyph, fontSize, uStart, state.uvScale, state.offsetV, state.angle, cursorU, cursorV);
 
     // Build wires for all contours
     const charWireHandles: number[] = [];
@@ -255,7 +266,9 @@ function rebuildAll(cylHandle: number, fi: number, font: opentype.Font) {
     });
 
     const adv = (glyph.advanceWidth ?? 0) / (font.unitsPerEm || 1000) * fontSize;
-    cursorX += adv + state.letterSpacing;
+    const step = (adv + state.letterSpacing) / 72 * state.uvScale;
+    cursorU += step * cosA;
+    cursorV += step * sinA;
   }
 
   console.log(`\n  wires: ${wireHandles.length}  shapes: ${shapeHandles.length}\n`);
@@ -328,6 +341,7 @@ function createPanel(cylHandle: number, fi: number, font: opentype.Font, onChang
   slider('offsetU',       'offsetU',       0.1,  6.18, 0.02);
   slider('offsetV',       'offsetV',      -0.9,  0.9,  0.02);
   slider('uvScale',       'uvScale',       0.5,  5.0,  0.05);
+  slider('angle',         'angle',       -180,   180,  1);
   slider('emboss depth',  'embossDepth',   0.02, 0.5,  0.005);
   slider('letterSpacing', 'letterSpacing',-10,   40,   0.5);
   slider('solid thickness','solidThickness',0.01, 0.3, 0.005);
