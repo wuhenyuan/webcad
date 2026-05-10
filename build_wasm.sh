@@ -36,7 +36,7 @@ else
 fi
 
 "$EMSDK_PYTHON" "$emsdk_dir/upstream/emscripten/emcc.py" \
-  bindings.cpp ../core/geometry.cpp ../core/occ_geometry.cpp \
+  bindings.cpp ../core/geometry.cpp ../core/occ_geometry.cpp ../core/occ_geometry_mesh.cpp \
   -o geometry_module.js \
   --bind \
   -s WASM=1 \
@@ -46,6 +46,8 @@ fi
   -s ENVIRONMENT='web,worker' \
   -s INITIAL_MEMORY=32MB \
   -I../core \
+  -I../vendor/bvh/src \
+  -std=c++20 \
   $OCCT_FLAGS \
   -O2
 

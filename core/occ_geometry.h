@@ -3,6 +3,11 @@
 #include <cstdint>
 #include <emscripten/val.h>
 
+// Forward declarations for internal OCCT types (used by non-OCCT includers like bindings)
+class TopoDS_Solid;
+class TopoDS_Face;
+class gp_Pnt;
+
 // ============================================================
 // OCCT-backed geometry — Phase 3
 // ============================================================
@@ -239,3 +244,12 @@ int  occBuildSolidFromFaceManual(int faceHandle, double thickness);
 // edge manifoldness, and max tolerance.  Reverses the solid if
 // volume is negative.  Returns true if the solid is manifold.
 bool occIsSolidManifold(int solidHandle);
+
+// Internal: validate and fix a TopoDS_Solid directly. Returns true if manifold.
+// Reverse the solid if volume is negative.
+bool IsSolidManifold(TopoDS_Solid& solid);
+
+// Create a triangular face from 3 points. Returns false on failure.
+// Logs diagnostic info on first failure (when verbose=true).
+bool buildTriangleFace(const gp_Pnt& a, const gp_Pnt& b, const gp_Pnt& c,
+                       TopoDS_Face& outFace, bool verbose);

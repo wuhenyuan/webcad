@@ -244,7 +244,7 @@ OccMesh occMakeCylinder(double radius, double height, double deflection) {
 // This avoids exposing TopoDS_Shape (a complex OCCT type) to JS,
 // while keeping the C++/JS boundary thin.
 
-static std::vector<TopoDS_Shape> g_shapeRegistry;
+std::vector<TopoDS_Shape> g_shapeRegistry;
 
 int occCreateCylinderShape(double radius, double height) {
     TopoDS_Shape shape = BRepPrimAPI_MakeCylinder(radius, height).Shape();
@@ -897,8 +897,8 @@ int occGetLastTopFace()   { return g_lastTopFaceH; }
 
 // Create a triangular face from 3 points. Returns null face on failure.
 // Logs diagnostic info on first failure.
-static bool buildTriangleFace(const gp_Pnt& a, const gp_Pnt& b, const gp_Pnt& c,
-                               TopoDS_Face& outFace, bool verbose) {
+bool buildTriangleFace(const gp_Pnt& a, const gp_Pnt& b, const gp_Pnt& c,
+                       TopoDS_Face& outFace, bool verbose) {
     // Pre-check: edge lengths
     double lenAB = a.Distance(b);
     double lenAC = a.Distance(c);
@@ -1857,7 +1857,7 @@ static int buildSideFaces(const TopoDS_Edge& bEdge,
 // Returns true if the solid passes closure + manifold-edge checks.
 // Prints diagnostic info to console.
 
-static bool IsSolidManifold(TopoDS_Solid& solid) {
+bool IsSolidManifold(TopoDS_Solid& solid) {
     printf("  [occ] IsSolidManifold:\n");
 
     bool allOk = true;

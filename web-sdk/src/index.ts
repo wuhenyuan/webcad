@@ -493,3 +493,56 @@ export function isSolidManifold(solidHandle: number): boolean {
   if (!_m) throw new Error('Not initialized.');
   return _m.occIsSolidManifold(solidHandle);
 }
+
+// ============================================================
+// Mesh text projection — Phase 11
+// ============================================================
+// Register a triangle mesh for text projection.
+// positions: Float32Array [x,y,z, ...]
+// indices: Uint32Array [i0,i1,i2, ...]
+// Returns mesh handle, or -1 on failure.
+export function registerTriangleMesh(positions: Float32Array, indices: Uint32Array): number {
+  if (!_m) throw new Error('Not initialized.');
+  return _m.occRegisterTriangleMesh(positions, indices);
+}
+
+// Release a registered mesh handle.
+export function releaseMeshHandle(handle: number): void {
+  if (!_m) throw new Error('Not initialized.');
+  _m.occReleaseMeshHandle(handle);
+}
+
+// Project text onto a registered mesh and build a manifold solid.
+// contourData: array of Float64Array in the same format as makeWireFromUVCurves.
+// Returns solid handle, or -1 on failure.
+export function projectTextOnMesh(
+  meshHandle: number,
+  contourData: Float64Array[],
+  ox: number, oy: number, oz: number,
+  nx: number, ny: number, nz: number,
+  ux: number, uy: number, uz: number,
+  vx: number, vy: number, vz: number,
+  textHeight: number,
+  embossDepth: number,
+  deflection: number,
+): number {
+  if (!_m) throw new Error('Not initialized.');
+  return _m.occProjectTextOnMesh(
+    meshHandle, contourData,
+    ox, oy, oz, nx, ny, nz,
+    ux, uy, uz, vx, vy, vz,
+    textHeight, embossDepth, deflection,
+  );
+}
+
+// Get the bottom face handle from the last projection.
+export function getMeshProjectionBottomFace(): number {
+  if (!_m) throw new Error('Not initialized.');
+  return _m.occGetMeshProjectionBottomFace();
+}
+
+// Get the top face handle from the last projection.
+export function getMeshProjectionTopFace(): number {
+  if (!_m) throw new Error('Not initialized.');
+  return _m.occGetMeshProjectionTopFace();
+}

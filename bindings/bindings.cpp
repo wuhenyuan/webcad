@@ -1,6 +1,7 @@
 #include <emscripten/bind.h>
 #include "../core/geometry.h"
 #include "../core/occ_geometry.h"
+#include "../core/occ_geometry_mesh.h"
 
 using namespace emscripten;
 
@@ -201,4 +202,14 @@ EMSCRIPTEN_BINDINGS(SolidFromFaceBindings) {
     function("occBuildSolidFromFace",       &occBuildSolidFromFace);
     function("occBuildSolidFromFaceManual", &occBuildSolidFromFaceManual);
     function("occIsSolidManifold",          &occIsSolidManifold);
+}
+
+// ---- Phase 11: Mesh text projection bindings ----
+
+EMSCRIPTEN_BINDINGS(MeshProjectionBindings) {
+    function("occRegisterTriangleMesh",      &occRegisterTriangleMesh);
+    function("occReleaseMeshHandle",         &occReleaseMeshHandle);
+    function("occProjectTextOnMesh",         &occProjectTextOnMesh);
+    function("occGetMeshProjectionBottomFace", &occGetMeshProjectionBottomFace);
+    function("occGetMeshProjectionTopFace",  &occGetMeshProjectionTopFace);
 }
