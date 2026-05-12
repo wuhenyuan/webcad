@@ -35,7 +35,7 @@ Handle(Geom_BSplineSurface) fitMeshRegionSurface(
 
 ---
 
-## 路线 2（当前）：PCA BSpline 曲面 + 顶点共享 + TPSA 侧壁
+## 路线 2（已废弃）：PCA BSpline 曲面 + 顶点共享 + TPSA 侧壁
 
 ```
 三角网格 → BVH 射线投射 → 3D 投影点 + 重心坐标插值法线
@@ -74,9 +74,11 @@ bedges[i] ↔ tedges[i] 按下标配对 → 8段三角形条带
 
 **废弃原因：** VertexPool 在函数签名中声明但实际未使用，`buildTriangleFace` 内部创建独立顶点，共享语义未落实。
 
-### 侧壁方案 C（当前）：buildTpsaSideWalls
+### 侧壁方案 C（已废弃）：buildTpsaSideWalls
 
 直接使用轮廓 3D 点数组构建侧壁，点顺序与 glyph 解析一致，不依赖 Face 内部 edge 顺序。
+
+**废弃原因：** BSpline 曲面上的参数曲线边界与侧壁直线段几何不一致，sewing 无法闭合 shell。改用 `MakeThickSolid` 由 OCCT 内部处理侧壁和顶面。
 
 ---
 
@@ -104,6 +106,82 @@ bedges[i] ↔ tedges[i] 按下标配对 → 8段三角形条带
 - [ ] 自适应 TPSA 分段：直线段减少细分、曲线段增加细分
 - [ ] 轮廓等间距重采样 (`GCPnts_UniformAbscissa`)，消除 Sliver 三角形
 - [ ] 布尔运算（text solid 与原始 mesh 的 Cut/Common）
+
+---
+
+## 路线 3：MakeThickSolid 替代手动侧壁（当前）
+
+### 问题：路线 2 的 `TopoDS::Solid` 崩溃
+
+**现象：** 所有字符（D、O、G 等）在 heal 阶段抛出 `OCCT error: TopoDS::Solid`，solid 构建失败。
+
+| 症状 | 原因 |
+|------|------|
+| `[occ] projectTextOnMesh [heal]: OCCT error: TopoDS::Solid` | `ShapeFix_Solid::Perform()` 返回非 Solid 类型 |
+| 单轮廓字符也失败 | Shell 未闭合，无法形成 Solid |
+
+**根因分析：**
+
+1. **几何不一致**：Bottom/top face 的边界是 BSpline 曲面上的参数曲线（弯曲），side wall 的边是 3D 直线段。两者在几何上不匹配，sewing tolerance 0.001 无法弥合。
+2. **曲面拟合误差**：5x5 BSpline grid 对 bottom 和 top 分别独立拟合，两个曲面的边界点虽然共享 TopoDS_Vertex（坐标一致），但曲面本身有偏差，导致 face 边界不贴合 side wall。
+3. **Laplacian smoothing 偏移**：Top contour 经过 2 次 Laplacian 平滑后，顶点位置与 side wall 计算的 top 端点（直接 normal offset，无平滑）不一致。
+
+### 修复方案
+
+```
+glyph contours → 2D 采样点
+  → Ray-cast onto mesh (BVH, 复用)
+  → 3D bottom contour points
+  → PCA → BSpline surface fitting
+  → BRepBuilderAPI_MakeFace(bsplineSurf, outerWire, holeWires) → bottom face
+  → BRepOffsetAPI_MakeThickSolid::MakeThickSolidBySimple(bottomFace, embossDepth)
+  → ShapeFix_Solid (兜底，检查 ShapeType 再 cast)
+  → TopoDS_Solid
+```
+
+**优势：**
+- 消除手动侧壁/顶面构建，OCCT 内部保证拓扑闭合
+- 无 sewing tolerance 问题
+- 天然支持多轮廓（带孔 face）
+- 代码量大幅减少（删除 ~200 行 side wall + top face + smoothing 逻辑）
+
+**已实现：** 2026-05-12，删除 `smoothContourNormals`、`makeTriFace`、`buildTpsaSideWalls`，替换为 `MakeThickSolidBySimple`。
+
+### 问题：MakeThickSolid 在 WASM 下崩溃
+
+**现象：** `getWasmTableEntry(...) is not a function`，TKOffset 内部 `BRepOffset_MakeOffset` 使用 C++ 异常做控制流，emscripten JS-based EH 无法处理多层嵌套 invoke 调用链。
+
+**结论：** `MakeThickSolid` 在 WASM 环境下对 BSpline 曲面不可用。需要换方案。
+
+### 问题：Bottom face 三角化失败（mesher status 128）
+
+**诊断结果 (2026-05-12)：**
+
+| 检查项 | 结果 | 说明 |
+|--------|------|------|
+| BSpline 曲面拟合 | ✅ 成功 | 5x5 grid, PCA ratio < 0.02 |
+| Face 构建 | ✅ 成功 | `MakeFace(surface, wire)` 返回非空 |
+| 投影点 vs 曲面偏差 | maxDist=0.31, avg=0.07-0.10 | 曲面不严格经过投影点 |
+| Edge pcurve | ❌ **全部缺失** | 所有边只有 3D curve，无 2D 参数曲线 |
+| Edge tolerance | 0.000000 | 未设置 |
+| Mesher status | 128 (ReMesh) | 三角化部分失败 |
+| 三角化结果 | 'D': 2 tris, 'O': 1 tri, 'G': 140 tris | 大部分区域跳过 |
+
+**根因：** Wire 边用 `BRepBuilderAPI_MakeEdge(v0, v1)` 构建 — 这是 3D 空间直线段，只有 3D curve。传给 `MakeFace(bsplineSurface, wire)` 时，OCCT 尝试将 3D 边投影到曲面生成 pcurve，但因为直线不在曲面上（偏差 0.31），投影失败，pcurve 未生成。`BRepMesh_IncrementalMesh` 需要 pcurve 来确定曲面上的三角化区域，没有 pcurve 就无法正确工作。
+
+### 修复方案：UV 空间构建边（pcurve 优先）
+
+```
+投影点 → 投影到 BSpline 曲面得到 UV 坐标
+       → Geom2d_Line(uv0, uv1) 构建 2D 参数曲线
+       → BRepBuilderAPI_MakeEdge(geom2dCurve, bsplineSurface) → 边天然有 pcurve
+       → BRepBuilderAPI_MakeWire → BRepBuilderAPI_MakeFace
+```
+
+**优势：**
+- 边严格在曲面上，pcurve 天然存在
+- mesher 可以正确三角化
+- 与路线 3（圆柱面）的 UV Bezier 方案一致
 
 ---
 

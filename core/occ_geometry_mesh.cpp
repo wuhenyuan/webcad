@@ -44,10 +44,8 @@
 #include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakeVertex.hxx>
-#include <BRepBuilderAPI_Sewing.hxx>
-#include <BRepBuilderAPI_MakeSolid.hxx>
+#include <BRepOffsetAPI_MakeThickSolid.hxx>
 #include <BRepCheck_Analyzer.hxx>
-#include <BRepCheck_Shell.hxx>
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepTools.hxx>
 #include <BRepTools_WireExplorer.hxx>
@@ -83,8 +81,8 @@
 #include <GCPnts_UniformDeflection.hxx>
 #include <Geom2d_BezierCurve.hxx>
 #include <ShapeFix_Solid.hxx>
-#include <ShapeFix_Shell.hxx>
 #include <ShapeFix_Face.hxx>
+#include <ShapeFix_Edge.hxx>
 #include <math_Jacobi.hxx>
 #include <math_Matrix.hxx>
 #include <GeomLib.hxx>
@@ -490,9 +488,17 @@ static void sampleSegment2D(int segType,
     if (poles.size() < 2) return;
 
     if (segType == 1) {
-        // Line: just use endpoints
-        if (outPts.empty()) outPts.push_back(poles.front());
-        outPts.push_back(poles.back());
+        // Line: subdivide if too long (max edge length in UV ~ deflection * 5)
+        double maxLen = deflection * 5.0;
+        gp_Pnt2d p0 = poles.front(), p1 = poles.back();
+        double len = p0.Distance(p1);
+        int nSeg = std::max(1, (int)std::ceil(len / maxLen));
+        if (outPts.empty()) outPts.push_back(p0);
+        for (int k = 1; k <= nSeg; k++) {
+            double t = (double)k / nSeg;
+            outPts.emplace_back(p0.X() * (1 - t) + p1.X() * t,
+                                p0.Y() * (1 - t) + p1.Y() * t);
+        }
         return;
     }
 
@@ -708,7 +714,7 @@ static Handle(Geom_BSplineSurface) fitMeshRegionSurface(
     double singularityRatio = eval2 / eval0;
     if (singularityRatio > 0.3) {
         printf("  [occ] fitMeshRegionSurface: point cloud too scattered "
-               "(eigenvalue ratio %.3f > 0.3, PCA parameterization unreliable)\n",
+"(eigenvalue ratio %.3f > 0.3, PCA parameterization unreliable)\n",
                singularityRatio);
         return nullptr;
     }
@@ -1032,158 +1038,6 @@ struct VertexPool {
     }
 };
 
-// Gaussian-weighted normal smoothing with configurable radius.
-// Each contour point's normal is averaged with neighbors within ±radius using Gaussian weights.
-static void smoothContourNormals(
-    std::vector<std::vector<gp_Vec>>& contourNormals,
-    int radius = 3)
-{
-    for (size_t ci = 0; ci < contourNormals.size(); ci++) {
-        auto& norms = contourNormals[ci];
-        int n = static_cast<int>(norms.size());
-        if (n < 3) continue;
-        std::vector<gp_Vec> smoothed(n);
-        double sigma = radius / 2.0;
-        double twoSigma2 = 2.0 * sigma * sigma;
-        for (int i = 0; i < n; i++) {
-            gp_Vec sum(0, 0, 0);
-            double totalWeight = 0;
-            for (int di = -radius; di <= radius; di++) {
-                int j = (i + di) % n;
-                if (j < 0) j += n;
-                double w = std::exp(-(di * di) / twoSigma2);
-                sum += norms[j] * w;
-                totalWeight += w;
-            }
-            if (totalWeight > 1e-20) sum /= totalWeight;
-            double mag = sum.Magnitude();
-            if (mag > 1e-20) sum /= mag;
-            else sum = norms[i];
-            smoothed[i] = sum;
-        }
-        norms = std::move(smoothed);
-    }
-}
-
-// ============================================================
-// 12. TPSA Side Wall Triangle Strips (vertex-shared)
-// ============================================================
-
-// Build a triangle face from 3 pre-existing vertices.
-// Vertices are NOT created inside — the caller provides shared vertices.
-static bool makeTriFace(const TopoDS_Vertex& va,
-                        const TopoDS_Vertex& vb,
-                        const TopoDS_Vertex& vc,
-                        TopoDS_Face& outFace)
-{
-    try {
-        gp_Pnt pa = BRep_Tool::Pnt(va);
-        gp_Pnt pb = BRep_Tool::Pnt(vb);
-        gp_Pnt pc = BRep_Tool::Pnt(vc);
-        gp_Vec ab(pa, pb), ac(pa, pc);
-        gp_Vec cross = ab.Crossed(ac);
-        if (cross.Magnitude() < 1e-13) return false;
-
-        BRepBuilderAPI_MakeWire wm;
-        TopoDS_Edge eab = BRepBuilderAPI_MakeEdge(va, vb);
-        TopoDS_Edge ebc = BRepBuilderAPI_MakeEdge(vb, vc);
-        TopoDS_Edge eca = BRepBuilderAPI_MakeEdge(vc, va);
-        if (eab.IsNull() || ebc.IsNull() || eca.IsNull()) return false;
-        wm.Add(eab); wm.Add(ebc); wm.Add(eca);
-        TopoDS_Wire w = wm.Wire();
-        if (w.IsNull()) return false;
-
-        gp_Pln plane(pa, gp_Dir(cross));
-        outFace = BRepBuilderAPI_MakeFace(plane, w);
-        return !outFace.IsNull();
-    } catch (...) {
-        return false;
-    }
-}
-
-// Build side wall triangle strips with full vertex sharing.
-// Bottom/top contour endpoints share TopoDS_Vertex with the bottom/top faces via VertexPool.
-// Intermediate segment vertices are shared between adjacent triangles within the strip.
-static int buildTpsaSideWalls(
-    const std::vector<std::vector<gp_Pnt>>& bottomContours,
-    const std::vector<std::vector<gp_Vec>>& contourNormals,
-    double embossDepth,
-    VertexPool& vpoolBot,
-    VertexPool& vpoolTop,
-    BRepBuilderAPI_Sewing& sewer)
-{
-    const int NSEG = 8;
-    int added = 0;
-
-    for (size_t ci = 0; ci < bottomContours.size() && ci < contourNormals.size(); ci++) {
-        const auto& pts   = bottomContours[ci];
-        const auto& norms = contourNormals[ci];
-        int n = (int)pts.size();
-        if (n < 2) continue;
-
-        bool alreadyClosed = (n >= 3 && pts[0].Distance(pts[n - 1]) < 1e-6);
-        int nLoop = alreadyClosed ? n - 1 : n;
-
-        for (int i = 0; i < nLoop; i++) {
-            int j = (i + 1) % nLoop;
-
-            // Shared contour vertices for this edge (bottom + top)
-            TopoDS_Vertex bvI = vpoolBot.get(ci, i, pts[i]);
-            TopoDS_Vertex bvJ = vpoolBot.get(ci, j, pts[j]);
-            gp_Pnt tpI(pts[i].X() + embossDepth * norms[i].X(),
-                       pts[i].Y() + embossDepth * norms[i].Y(),
-                       pts[i].Z() + embossDepth * norms[i].Z());
-            gp_Pnt tpJ(pts[j].X() + embossDepth * norms[j].X(),
-                       pts[j].Y() + embossDepth * norms[j].Y(),
-                       pts[j].Z() + embossDepth * norms[j].Z());
-
-            // Skip edge if top endpoints are too close (would fold side wall)
-            if (tpI.Distance(tpJ) < embossDepth * 0.02) continue;
-
-            TopoDS_Vertex tvI = vpoolTop.get(ci, i, tpI);
-            TopoDS_Vertex tvJ = vpoolTop.get(ci, j, tpJ);
-
-            // Track previous segment's vertices for sharing within the strip
-            TopoDS_Vertex prevBv = bvI;
-            TopoDS_Vertex prevTv = tvI;
-
-            for (int s = 0; s < NSEG; s++) {
-                double t1 = static_cast<double>(s + 1) / NSEG;
-
-                // Bottom vertex for this segment end
-                gp_Pnt bp1(pts[i].X() * (1 - t1) + pts[j].X() * t1,
-                           pts[i].Y() * (1 - t1) + pts[j].Y() * t1,
-                           pts[i].Z() * (1 - t1) + pts[j].Z() * t1);
-                TopoDS_Vertex bv1 = (s == NSEG - 1) ? bvJ
-                    : BRepBuilderAPI_MakeVertex(bp1);
-
-                // Top vertex: normal-aligned extrusion from bottom point
-                gp_Vec n1(norms[i].X() * (1 - t1) + norms[j].X() * t1,
-                         norms[i].Y() * (1 - t1) + norms[j].Y() * t1,
-                         norms[i].Z() * (1 - t1) + norms[j].Z() * t1);
-                double n1m = n1.Magnitude();
-                if (n1m > 1e-20) n1 /= n1m;
-                gp_Pnt tp1(bp1.X() + embossDepth * n1.X(),
-                           bp1.Y() + embossDepth * n1.Y(),
-                           bp1.Z() + embossDepth * n1.Z());
-                TopoDS_Vertex tv1 = (s == NSEG - 1) ? tvJ
-                    : BRepBuilderAPI_MakeVertex(tp1);
-
-                // Triangle 1: prevBv → bv1 → prevTv
-                TopoDS_Face tri1;
-                if (makeTriFace(prevBv, bv1, prevTv, tri1)) { sewer.Add(tri1); added++; }
-                // Triangle 2: bv1 → tv1 → prevTv
-                TopoDS_Face tri2;
-                if (makeTriFace(bv1, tv1, prevTv, tri2)) { sewer.Add(tri2); added++; }
-
-                prevBv = bv1;
-                prevTv = tv1;
-            }
-        }
-    }
-    return added;
-}
-
 // ============================================================
 // 12. Main Projection Function
 // ============================================================
@@ -1320,10 +1174,36 @@ int occProjectTextOnMesh(
         if (a > maxAbsArea) { maxAbsArea = a; outerIdx = (int)ci; }
     }
 
-    // --- Build bottom wires from projected 3D points (shared vertices) ---
+    // --- Fit BSpline surface first, then build wires in UV space ---
+    step = "fit surface";
+    gp_Vec avgNrm(0,0,0);
+    {
+        int nTotal = 0;
+        for (auto& pts : contour3DBottom) { for (auto& p : pts) { (void)p; nTotal++; }}
+        if (nTotal < 3) { printf("  [occ] too few points (%d)\n", nTotal); return -1; }
+        for (auto& norms : contourNormals)
+            for (auto& n : norms) avgNrm += n;
+        double nmag = avgNrm.Magnitude();
+        if (nmag < 1e-10) avgNrm = nAxis;
+        else avgNrm /= nmag;
+    }
+
+    Handle(Geom_BSplineSurface) fittedSurface;
+    {
+        std::vector<gp_Pnt> allBottomPts;
+        for (auto& pts : contour3DBottom)
+            allBottomPts.insert(allBottomPts.end(), pts.begin(), pts.end());
+        fittedSurface = fitMeshRegionSurface(allBottomPts, avgNrm);
+    }
+
+    if (fittedSurface.IsNull()) {
+        printf("  [occ] BSpline surface fitting failed\n");
+        return -1;
+    }
+    printf("  [occ] using fitted BSpline surface for bottom face\n");
+
+    // --- Build wires using UV-space edges (pcurve-first) ---
     step = "build wires";
-    VertexPool vpoolBot;     // shared bottom vertices
-    VertexPool vpoolTop;     // shared top vertices
     std::vector<TopoDS_Wire> bottomWires;
 
     for (size_t ci = 0; ci < contour3DBottom.size(); ci++) {
@@ -1331,22 +1211,30 @@ int occProjectTextOnMesh(
         size_t n = pts.size();
         if (n < 2) continue;
 
-        // Detect if contour is already closed (first == last 3D point)
         bool alreadyClosed = (n >= 3 && pts[0].Distance(pts[n - 1]) < 1e-6);
+        size_t nLoop = alreadyClosed ? n - 1 : n;
 
         int edgesAdded = 0;
         BRepBuilderAPI_MakeWire wm;
-        size_t nLoop = alreadyClosed ? n - 1 : n;  // skip duplicate last point
         for (size_t i = 0; i < nLoop; i++) {
             size_t j = (i + 1) % nLoop;
             double len = pts[i].Distance(pts[j]);
             if (len < 1e-6) continue;
 
-            TopoDS_Vertex v0 = vpoolBot.get((int)ci, (int)i, pts[i]);
-            TopoDS_Vertex v1 = vpoolBot.get((int)ci, (int)j, pts[j]);
-
             try {
-                TopoDS_Edge e = BRepBuilderAPI_MakeEdge(v0, v1);
+                TopoDS_Edge e = BRepBuilderAPI_MakeEdge(
+                    BRepBuilderAPI_MakeVertex(pts[i]),
+                    BRepBuilderAPI_MakeVertex(pts[j]));
+                if (e.IsNull()) continue;
+
+                // Add pcurve by projecting 3D edge onto BSpline surface
+                ShapeFix_Edge edgeFixer;
+                edgeFixer.FixAddPCurve(e, fittedSurface, TopLoc_Location(), Standard_False);
+
+                // Set edge tolerance to accommodate 3D-vs-pcurve deviation
+                BRep_Builder bb;
+                bb.UpdateEdge(e, 0.5);
+
                 if (!e.IsNull()) { wm.Add(e); edgesAdded++; }
             } catch (...) {}
         }
@@ -1367,284 +1255,115 @@ int occProjectTextOnMesh(
         printf("  [occ] no valid wires\n"); return -1;
     }
 
-    // --- Average contour normal (for normal constraint later) ---
-    gp_Vec avgNrm(0,0,0);
-    {
-        int nTotal = 0;
-        for (auto& pts : contour3DBottom) { for (auto& p : pts) { nTotal++; }}
-        if (nTotal < 3) { printf("  [occ] too few points (%d)\n", nTotal); return -1; }
-        for (auto& norms : contourNormals)
-            for (auto& n : norms) avgNrm += n;
-        double nmag = avgNrm.Magnitude();
-        if (nmag < 1e-10) avgNrm = nAxis;
-        else avgNrm /= nmag;
-    }
-
-    // --- Build bottom face (BSpline surface fitting with plane fallback) ---
+    // --- Build bottom face ---
     step = "bottom face";
     TopoDS_Face bottomFace;
-    Handle(Geom_BSplineSurface) fittedSurface;
     {
-        // Collect all bottom 3D points for surface fitting
-        std::vector<gp_Pnt> allBottomPts;
-        for (auto& pts : contour3DBottom)
-            allBottomPts.insert(allBottomPts.end(), pts.begin(), pts.end());
-
-        fittedSurface = fitMeshRegionSurface(allBottomPts, avgNrm);
-
-        if (!fittedSurface.IsNull()) {
-            printf("  [occ] using fitted BSpline surface for bottom face\n");
-            try {
-                BRepBuilderAPI_MakeFace fb(fittedSurface, bottomWires[outerIdx], Standard_True);
-                if (fb.IsDone()) {
-                    for (size_t i = 0; i < bottomWires.size(); i++) {
-                        if ((int)i == outerIdx) continue;
-                        try { fb.Add(bottomWires[i]); }
-                        catch (...) { printf("  [occ] hole wire[%zu] rejected by BSpline surface\n", i); }
-                    }
-                    bottomFace = fb.Face();
-                    if (!bottomFace.IsNull()) {
-                        printf("  [occ] bottom face built on BSpline surface (%zu wires)\n", bottomWires.size());
-                    }
-                } else {
-                    printf("  [occ] BSpline MakeFace not done, falling back\n");
-                }
-            } catch (Standard_Failure& e) {
-                printf("  [occ] BSpline face exception: %s, falling back\n", e.GetMessageString());
-            } catch (...) {
-                printf("  [occ] BSpline face unknown exception, falling back\n");
-            }
-        }
-
-        // Fallback: flat plane
-        if (bottomFace.IsNull()) {
-            fittedSurface.Nullify();
-            gp_Dir refDir(avgNrm);
-            gp_Pnt refPt(0,0,0);
-            { auto& outerPts = contour3DBottom[outerIdx];
-              for (auto& p : outerPts) refPt.ChangeCoord() += p.Coord();
-              refPt.ChangeCoord() /= (double)outerPts.size(); }
-            gp_Pln refPlane(refPt, refDir);
-
-            try {
-                BRepBuilderAPI_MakeFace fb(refPlane, bottomWires[outerIdx]);
+        try {
+            BRepBuilderAPI_MakeFace fb(fittedSurface, bottomWires[outerIdx], Standard_True);
+            if (fb.IsDone()) {
                 for (size_t i = 0; i < bottomWires.size(); i++) {
                     if ((int)i == outerIdx) continue;
                     try { fb.Add(bottomWires[i]); }
-                    catch (...) { printf("  [occ] hole wire[%zu] rejected by plane\n", i); }
+                    catch (...) { printf("  [occ] hole wire[%zu] rejected\n", i); }
                 }
                 bottomFace = fb.Face();
-            } catch (Standard_Failure& e) {
-                printf("  [occ] MakeFace exception: %s\n", e.GetMessageString());
-            } catch (...) {
-                printf("  [occ] MakeFace unknown exception\n");
+                if (!bottomFace.IsNull()) {
+                    printf("  [occ] bottom face built on BSpline surface (%zu wires)\n", bottomWires.size());
+                }
+            } else {
+                printf("  [occ] MakeFace not done\n");
             }
-            if (!bottomFace.IsNull()) {
-                printf("  [occ] bottom face built on flat plane (fallback) (%zu wires)\n", bottomWires.size());
-            }
+        } catch (Standard_Failure& e) {
+            printf("  [occ] MakeFace exception: %s\n", e.GetMessageString());
+        } catch (...) {
+            printf("  [occ] MakeFace unknown exception\n");
         }
-
-        if (bottomFace.IsNull()) {
-            printf("  [occ] bottom face FAILED\n"); return -1;
-        }
-        BRepMesh_IncrementalMesh(bottomFace, deflection * 0.3);
-        BRepMesh_IncrementalMesh(bottomFace, deflection * 0.5);
     }
 
-    // --- Smooth contour normals before computing top face ---
-    smoothContourNormals(contourNormals, 1);  // 3-point window
+    if (bottomFace.IsNull()) {
+        printf("  [occ] bottom face FAILED\n"); return -1;
+    }
 
-    // --- Normal constraint: mix toward plane normal to suppress extreme deflections ---
+
+    // --- DEBUG: validate face vs original projected points ---
+    step = "validate face";
     {
-        gp_Vec pnVec(avgNrm.X(), avgNrm.Y(), avgNrm.Z());
-        const double mixFactor = 0.5;
-        for (auto& norms : contourNormals) {
-            for (auto& n : norms) {
-                gp_Vec mixed = n * (1.0 - mixFactor) + pnVec * mixFactor;
-                double mag = mixed.Magnitude();
-                if (mag > 1e-20) n = mixed / mag;
-            }
-        }
-    }
-
-    // --- Build top face: offset contour points + same wire structure ---
-    step = "top face";
-    std::vector<std::vector<gp_Pnt>> topContourPts(contour3DBottom.size());
-    for (size_t ci = 0; ci < contour3DBottom.size() && ci < contourNormals.size(); ci++) {
-        auto& norms = contourNormals[ci];
-        auto& bpts = contour3DBottom[ci];
-        for (size_t k = 0; k < bpts.size() && k < norms.size(); k++) {
-            topContourPts[ci].push_back(gp_Pnt(
-                bpts[k].X() + embossDepth * norms[k].X(),
-                bpts[k].Y() + embossDepth * norms[k].Y(),
-                bpts[k].Z() + embossDepth * norms[k].Z()));
-        }
-    }
-
-    // --- Laplacian position smoothing for top vertices ---
-    for (auto& pts : topContourPts) {
-        int n = static_cast<int>(pts.size());
-        if (n < 3) continue;
-        for (int iter = 0; iter < 2; iter++) {
-            std::vector<gp_Pnt> smoothed(n);
-            for (int i = 0; i < n; i++) {
-                int prev = (i == 0) ? n - 1 : i - 1;
-                int next = (i + 1) % n;
-                smoothed[i] = gp_Pnt(
-                    pts[i].X() * 0.5 + (pts[prev].X() + pts[next].X()) * 0.25,
-                    pts[i].Y() * 0.5 + (pts[prev].Y() + pts[next].Y()) * 0.25,
-                    pts[i].Z() * 0.5 + (pts[prev].Z() + pts[next].Z()) * 0.25);
-            }
-            pts = std::move(smoothed);
-        }
-    }
-
-    // --- Populate top vertex pool from smoothed positions ---
-    for (size_t ci = 0; ci < topContourPts.size(); ci++) {
-        auto& pts = topContourPts[ci];
-        for (size_t k = 0; k < pts.size(); k++) {
-            vpoolTop.get((int)ci, (int)k, pts[k]);
-        }
-    }
-
-    std::vector<TopoDS_Wire> topWires;
-    for (size_t ci = 0; ci < topContourPts.size(); ci++) {
-        auto& pts = topContourPts[ci];
-        size_t n = pts.size();
-        if (n < 2) continue;
-        bool alreadyClosed = (n >= 3 && pts[0].Distance(pts[n - 1]) < 1e-6);
-        size_t nLoop = alreadyClosed ? n - 1 : n;
-        BRepBuilderAPI_MakeWire wm;
-        for (size_t i = 0; i < nLoop; i++) {
-            size_t j = (i + 1) % nLoop;
-            double len = pts[i].Distance(pts[j]);
-            if (len < embossDepth * 0.005) continue;
-            try {
-                TopoDS_Vertex v0 = vpoolTop.get((int)ci, (int)i, pts[i]);
-                TopoDS_Vertex v1 = vpoolTop.get((int)ci, (int)j, pts[j]);
-                TopoDS_Edge e = BRepBuilderAPI_MakeEdge(v0, v1);
-                if (!e.IsNull()) wm.Add(e);
-            } catch (...) {}
-        }
-        TopoDS_Wire w = wm.Wire();
-        if (!w.IsNull()) { w.Closed(Standard_True); topWires.push_back(w); }
-    }
-
-    // --- Build top face (BSpline surface fitting with plane fallback) ---
-    TopoDS_Face topFace;
-    if (!topWires.empty() && outerIdx < (int)topWires.size() && outerIdx < (int)topContourPts.size()) {
-        // Try BSpline surface fitting for top face
-        std::vector<gp_Pnt> allTopPts;
-        for (auto& pts : topContourPts)
-            allTopPts.insert(allTopPts.end(), pts.begin(), pts.end());
-
-        Handle(Geom_BSplineSurface) topSurface = fitMeshRegionSurface(allTopPts, avgNrm);
-
-        if (!topSurface.IsNull()) {
-            try {
-                BRepBuilderAPI_MakeFace fb(topSurface, topWires[outerIdx], Standard_True);
-                if (fb.IsDone()) {
-                    for (size_t i = 0; i < topWires.size(); i++) {
-                        if ((int)i == outerIdx) continue;
-                        try { fb.Add(topWires[i]); }
-                        catch (...) { printf("  [occ] top hole wire[%zu] rejected by BSpline\n", i); }
-                    }
-                    topFace = fb.Face();
-                    if (!topFace.IsNull()) {
-                        printf("  [occ] top face built on BSpline surface\n");
-                    }
+        Handle(Geom_Surface) faceSurf = BRep_Tool::Surface(bottomFace);
+        double maxDist = 0, sumDist = 0;
+        int nPts = 0;
+        for (auto& pts : contour3DBottom) {
+            for (auto& p : pts) {
+                GeomAPI_ProjectPointOnSurf proj(p, faceSurf);
+                if (proj.NbPoints() > 0) {
+                    double d = proj.LowerDistance();
+                    if (d > maxDist) maxDist = d;
+                    sumDist += d;
                 }
-            } catch (...) {
-                printf("  [occ] top BSpline face failed, falling back\n");
+                nPts++;
             }
         }
+        printf("  [occ] face validation: %d pts, maxDist=%.6f, avgDist=%.6f\n",
+               nPts, maxDist, nPts > 0 ? sumDist / nPts : 0.0);
 
-        // Fallback: flat plane
-        if (topFace.IsNull()) {
-            gp_Pnt refPt(0,0,0);
-            { auto& outerTop = topContourPts[outerIdx];
-              for (auto& p : outerTop) refPt.ChangeCoord() += p.Coord();
-              refPt.ChangeCoord() /= (double)outerTop.size(); }
-            gp_Pln topRefPlane(refPt, gp_Dir(avgNrm));
-            try {
-                BRepBuilderAPI_MakeFace fb(topRefPlane, topWires[outerIdx]);
-                for (size_t i = 0; i < topWires.size(); i++) {
-                    if ((int)i == outerIdx) continue;
-                    try { fb.Add(topWires[i]); }
-                    catch (...) { printf("  [occ] top hole wire[%zu] rejected\n", i); }
-                }
-                topFace = fb.Face();
-            } catch (...) {}
+        // Check each edge: has pcurve? tolerance? 3D curve vs surface deviation?
+        int edgeIdx = 0;
+        for (TopExp_Explorer eex(bottomFace, TopAbs_EDGE); eex.More(); eex.Next(), edgeIdx++) {
+            TopoDS_Edge edge = TopoDS::Edge(eex.Current());
+            double eTol = BRep_Tool::Tolerance(edge);
+
+            // Check if edge has pcurve on this face
+            double f2d, l2d;
+            Handle(Geom2d_Curve) pcurve = BRep_Tool::CurveOnSurface(edge, bottomFace, f2d, l2d);
+
+            // Check 3D curve
+            double f3d, l3d;
+            Handle(Geom_Curve) curve3d = BRep_Tool::Curve(edge, f3d, l3d);
+
+            // Sample midpoint: compare 3D curve point vs surface(pcurve) point
+            double devMid = -1;
+            if (!pcurve.IsNull() && !curve3d.IsNull() && !faceSurf.IsNull()) {
+                double tMid3d = (f3d + l3d) / 2.0;
+                double tMid2d = (f2d + l2d) / 2.0;
+                gp_Pnt p3d = curve3d->Value(tMid3d);
+                gp_Pnt2d uv = pcurve->Value(tMid2d);
+                gp_Pnt pSurf = faceSurf->Value(uv.X(), uv.Y());
+                devMid = p3d.Distance(pSurf);
+            }
+
+            if (edgeIdx < 5 || devMid > 0.01 || pcurve.IsNull() || curve3d.IsNull()) {
+                printf("  [occ] edge[%d]: tol=%.6f, pcurve=%s, curve3d=%s, midDev=%.6f\n",
+                       edgeIdx, eTol,
+                       pcurve.IsNull() ? "NO" : "yes",
+                       curve3d.IsNull() ? "NO" : "yes",
+                       devMid);
+            }
         }
-
-        if (!topFace.IsNull()) BRepMesh_IncrementalMesh(topFace, deflection * 0.5);
-    }
-    printf("  [occ] top face %s\n", topFace.IsNull() ? "FAILED" : "built");
-
-    // --- Sew faces (vertex sharing → near-zero tolerance) ---
-    const double sewTol = 0.001;
-    printf("  [occ] sewTol=%.3f (vertex-shared)\n", sewTol);
-    BRepBuilderAPI_Sewing sewer(sewTol);
-    sewer.Add(bottomFace);
-    if (!topFace.IsNull()) sewer.Add(topFace);
-
-    // --- Side walls: use contour points directly (preserves correct ordering) ---
-    step = "side walls";
-    int sideCount = buildTpsaSideWalls(contour3DBottom, contourNormals, embossDepth, vpoolBot, vpoolTop, sewer);
-    printf("  [occ] projectTextOnMesh: sewing %d side faces...\n", sideCount);
-
-    sewer.Perform();
-    TopoDS_Shape sewed = sewer.SewedShape();
-    if (sewed.IsNull()) {
-        printf("  [occ] projectTextOnMesh: sewing produced null shape\n");
-        return -1;
+        printf("  [occ] total edges: %d\n", edgeIdx);
     }
 
-    // --- Extract shell ---
-    TopoDS_Shell shell;
-    for (TopExp_Explorer ex(sewed, TopAbs_SHELL); ex.More(); ex.Next()) {
-        shell = TopoDS::Shell(ex.Current());
-        break;
+    // --- DEBUG: return bottom face directly for visualization ---
+    step = "register face";
+    {
+        // Ensure edges have 3D curves and pcurves for mesher
+        BRepLib::BuildCurves3d(bottomFace, 1e-5);
+        for (TopExp_Explorer eex(bottomFace, TopAbs_EDGE); eex.More(); eex.Next()) {
+            BRepLib::SameParameter(TopoDS::Edge(eex.Current()), 1e-5);
+        }
+        ShapeFix_Face fixer(bottomFace);
+        fixer.Perform();
+        bottomFace = TopoDS::Face(fixer.Face());
+
+        // Force triangulation
+        BRepMesh_IncrementalMesh mesher(bottomFace, deflection);
+        mesher.Perform();
+        printf("  [occ] mesher status: %d\n", mesher.GetStatusFlags());
+
+        int faceHandle = static_cast<int>(g_shapeRegistry.size());
+        g_shapeRegistry.push_back(bottomFace);
+        printf("  [occ] projectTextOnMesh: returning bottom face handle=%d (debug)\n", faceHandle);
+        return faceHandle;
     }
-    if (shell.IsNull()) {
-        printf("  [occ] projectTextOnMesh: no shell in sewed result\n");
-        return -1;
-    }
-
-    // --- Heal and make solid ---
-    step = "heal";
-    ShapeFix_Shell shellFixer(shell);
-    shellFixer.Perform();
-    TopoDS_Shell fixedShell = TopoDS::Shell(shellFixer.Shape());
-
-    BRepBuilderAPI_MakeSolid solidMaker(fixedShell);
-    TopoDS_Solid resultSolid = solidMaker.Solid();
-
-    ShapeFix_Solid solidFixer(resultSolid);
-    solidFixer.Perform();
-    resultSolid = TopoDS::Solid(solidFixer.Shape());
-
-    // --- Geometry hardening ---
-    BRepLib::BuildCurves3d(resultSolid, 1e-9);
-    for (TopExp_Explorer eex(resultSolid, TopAbs_EDGE); eex.More(); eex.Next()) {
-        BRepLib::SameParameter(TopoDS::Edge(eex.Current()), 1e-9);
-    }
-
-    // --- Validate ---
-    step = "validate";
-    bool manifold = IsSolidManifold(resultSolid);
-    printf("  [occ] projectTextOnMesh: %s\n", manifold ? "MANIFOLD" : "NON-MANIFOLD (continuing)");
-
-    // --- Register solid ---
-    int solidHandle = static_cast<int>(g_shapeRegistry.size());
-    g_shapeRegistry.push_back(resultSolid);
-
-    g_lastMeshBottomFace = -1; // triangulated: no single bottom face
-    g_lastMeshTopFace   = -1;
-
-    printf("  [occ] projectTextOnMesh: solid=%d sideFaces=%d (%s)\n",
-           solidHandle, sideCount, manifold ? "MANIFOLD" : "NON-MANIFOLD");
-    return solidHandle;
 
     } catch (Standard_Failure& e) {
         printf("  [occ] projectTextOnMesh [%s]: OCCT error: %s\n", step, e.GetMessageString());

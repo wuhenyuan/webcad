@@ -243,7 +243,7 @@ function drawProjectedPreview(contours: Float64Array[], O: THREE.Vector3, U: THR
   if (!dogMesh) return group;
 
   const rc = new THREE.Raycaster();
-  const dotGeo = new THREE.SphereGeometry(0.3, 4, 4);
+  const dotGeo = new THREE.SphereGeometry(0.05, 4, 4);
   const dotMat = new THREE.MeshBasicMaterial({ color: 0xff4444 });
   const curveMat = new THREE.LineBasicMaterial({ color: 0xff8844, linewidth: 1 });
 
@@ -376,15 +376,21 @@ function doProject() {
         geo.setAttribute('position', new THREE.BufferAttribute(sm.positions, 3));
         geo.setAttribute('normal', new THREE.BufferAttribute(sm.normals, 3));
         geo.setIndex(new THREE.BufferAttribute(sm.indices, 1));
-        const mat = new THREE.MeshStandardMaterial({
-          color: 0xff8844, roughness: 0.4, metalness: 0.05,
-          side: THREE.DoubleSide, polygonOffset: true,
-          polygonOffsetFactor: -1, polygonOffsetUnits: -1,
+        const mat = new THREE.MeshBasicMaterial({
+          color: 0xff8844,
+          side: THREE.DoubleSide,
+          depthTest: false,
+          transparent: true,
+          opacity: 0.8,
         });
-        resultGroup.add(new THREE.Mesh(geo, mat));
+        const mesh = new THREE.Mesh(geo, mat);
+        mesh.renderOrder = 999;
+        resultGroup.add(mesh);
         // Wireframe
-        const wMat = new THREE.MeshBasicMaterial({ color: 0x221100, wireframe: true });
-        resultGroup.add(new THREE.Mesh(geo, wMat));
+        const wMat = new THREE.MeshBasicMaterial({ color: 0x221100, wireframe: true, depthTest: false });
+        const wMesh = new THREE.Mesh(geo, wMat);
+        wMesh.renderOrder = 1000;
+        resultGroup.add(wMesh);
       }
     } else {
       console.log(`  Solid '${ch}': FAILED (${solidHandle})`);

@@ -18,7 +18,7 @@ EMSDK_DIR="$HOME/emsdk"
 EMSDK_PYTHON="$EMSDK_DIR/python/3.13.3_64bit/python.exe"
 
 # Add cmake/ninja if in $HOME/tools
-CMAKE_BIN="$HOME/tools/cmake/cmake-3.29.3-windows-x86_64/bin"
+CMAKE_BIN="$HOME/tools/cmake-3.29.3-windows-x86_64/bin"
 NINJA_BIN="$HOME/tools"
 export PATH="$CMAKE_BIN:$NINJA_BIN:$EMSDK_DIR:$EMSDK_DIR/upstream/emscripten:$EMSDK_DIR/node/22.16.0_64bit/bin:$PATH"
 
