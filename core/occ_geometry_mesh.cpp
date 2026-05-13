@@ -1380,3 +1380,532 @@ int occProjectTextOnMesh(
 
 int occGetMeshProjectionBottomFace() { return g_lastMeshBottomFace; }
 int occGetMeshProjectionTopFace()   { return g_lastMeshTopFace; }
+
+// ============================================================
+// 14. Build face from pre-computed 3D contour points
+// ============================================================
+
+int occBuildFaceFromPoints(emscripten::val contourPoints, double embossDepth, double deflection) {
+    const char* step = "init";
+    try {
+
+    int numContours = contourPoints["length"].as<int>();
+    if (numContours < 1) { printf("  [occ] buildFaceFromPoints: no contours\n"); return -1; }
+
+    // Parse 3D points from JS arrays
+    std::vector<std::vector<gp_Pnt>> contours3D;
+    for (int ci = 0; ci < numContours; ci++) {
+        emscripten::val arr = contourPoints[ci];
+        int len = arr["length"].as<int>();
+        if (len < 9) continue; // need at least 3 points
+        std::vector<gp_Pnt> pts;
+        for (int i = 0; i < len; i += 3) {
+            double x = arr[i].as<double>();
+            double y = arr[i + 1].as<double>();
+            double z = arr[i + 2].as<double>();
+            pts.emplace_back(x, y, z);
+        }
+        if (pts.size() >= 3) contours3D.push_back(std::move(pts));
+    }
+    if (contours3D.empty()) { printf("  [occ] buildFaceFromPoints: no valid contours\n"); return -1; }
+    printf("  [occ] buildFaceFromPoints: %zu contours, total %d pts\n",
+           contours3D.size(), [&]{ int n=0; for(auto&c:contours3D) n+=(int)c.size(); return n; }());
+
+    // Classify outer contour (largest area in 3D projection)
+    int outerIdx = 0;
+    double maxArea = 0;
+    for (size_t ci = 0; ci < contours3D.size(); ci++) {
+        auto& pts = contours3D[ci];
+        // Approximate area using cross product sum
+        gp_Vec areaVec(0,0,0);
+        gp_Pnt p0 = pts[0];
+        for (size_t i = 1; i + 1 < pts.size(); i++) {
+            gp_Vec v1(p0, pts[i]), v2(p0, pts[i+1]);
+            areaVec += v1.Crossed(v2);
+        }
+        double a = areaVec.Magnitude();
+        if (a > maxArea) { maxArea = a; outerIdx = (int)ci; }
+    }
+
+    // Compute average normal from outer contour
+    step = "normal";
+    gp_Vec avgNrm(0,0,0);
+    {
+        auto& pts = contours3D[outerIdx];
+        gp_Pnt p0 = pts[0];
+        for (size_t i = 1; i + 1 < pts.size(); i++) {
+            gp_Vec v1(p0, pts[i]), v2(p0, pts[i+1]);
+            avgNrm += v1.Crossed(v2);
+        }
+        double mag = avgNrm.Magnitude();
+        if (mag < 1e-10) { printf("  [occ] buildFaceFromPoints: degenerate normal\n"); return -1; }
+        avgNrm /= mag;
+    }
+
+    // Fit BSpline surface
+    step = "fit surface";
+    std::vector<gp_Pnt> allPts;
+    for (auto& c : contours3D) allPts.insert(allPts.end(), c.begin(), c.end());
+    Handle(Geom_BSplineSurface) fittedSurface = fitMeshRegionSurface(allPts, avgNrm);
+    if (fittedSurface.IsNull()) {
+        printf("  [occ] buildFaceFromPoints: surface fitting failed\n"); return -1;
+    }
+    printf("  [occ] buildFaceFromPoints: BSpline surface fitted\n");
+
+    // Build wires with pcurves
+    step = "build wires";
+    std::vector<TopoDS_Wire> wires;
+    for (size_t ci = 0; ci < contours3D.size(); ci++) {
+        auto& pts = contours3D[ci];
+        size_t n = pts.size();
+        bool alreadyClosed = (n >= 3 && pts[0].Distance(pts[n-1]) < 1e-6);
+        size_t nLoop = alreadyClosed ? n - 1 : n;
+
+        BRepBuilderAPI_MakeWire wm;
+        int edgesAdded = 0;
+        for (size_t i = 0; i < nLoop; i++) {
+            size_t j = (i + 1) % nLoop;
+            if (pts[i].Distance(pts[j]) < 1e-6) continue;
+            try {
+                TopoDS_Edge e = BRepBuilderAPI_MakeEdge(
+                    BRepBuilderAPI_MakeVertex(pts[i]),
+                    BRepBuilderAPI_MakeVertex(pts[j]));
+                if (e.IsNull()) continue;
+                ShapeFix_Edge edgeFixer;
+                edgeFixer.FixAddPCurve(e, fittedSurface, TopLoc_Location(), Standard_False);
+                BRep_Builder bb;
+                bb.UpdateEdge(e, 0.5);
+                wm.Add(e); edgesAdded++;
+            } catch (...) {}
+        }
+        TopoDS_Wire w = wm.Wire();
+        if (!w.IsNull()) {
+            w.Closed(Standard_True);
+            wires.push_back(w);
+            printf("  [occ] wire[%zu]: %d edges\n", ci, edgesAdded);
+        }
+    }
+    if (wires.empty() || outerIdx >= (int)wires.size()) {
+        printf("  [occ] buildFaceFromPoints: no valid wires\n"); return -1;
+    }
+
+    // Build face
+    step = "build face";
+    TopoDS_Face face;
+    {
+        BRepBuilderAPI_MakeFace fb(fittedSurface, wires[outerIdx], Standard_True);
+        if (fb.IsDone()) {
+            for (size_t i = 0; i < wires.size(); i++) {
+                if ((int)i == outerIdx) continue;
+                try { fb.Add(wires[i]); } catch (...) {}
+            }
+            face = fb.Face();
+        }
+    }
+    if (face.IsNull()) { printf("  [occ] buildFaceFromPoints: face failed\n"); return -1; }
+
+    // Fix and mesh
+    BRepLib::BuildCurves3d(face, 1e-5);
+    for (TopExp_Explorer eex(face, TopAbs_EDGE); eex.More(); eex.Next())
+        BRepLib::SameParameter(TopoDS::Edge(eex.Current()), 1e-5);
+    ShapeFix_Face fixer(face);
+    fixer.Perform();
+    face = TopoDS::Face(fixer.Face());
+    BRepMesh_IncrementalMesh mesher(face, deflection);
+    mesher.Perform();
+
+    int handle = static_cast<int>(g_shapeRegistry.size());
+    g_shapeRegistry.push_back(face);
+    printf("  [occ] buildFaceFromPoints: handle=%d\n", handle);
+    return handle;
+
+    } catch (Standard_Failure& e) {
+        printf("  [occ] buildFaceFromPoints [%s]: %s\n", step, e.GetMessageString());
+        return -1;
+    } catch (...) {
+        printf("  [occ] buildFaceFromPoints [%s]: unknown error\n", step);
+        return -1;
+    }
+}
+
+// ============================================================
+// 15. Unified projection + preview
+// ============================================================
+
+emscripten::val occProjectTextOnMeshWithPreview(
+    int meshHandle,
+    emscripten::val contourData,
+    double ox, double oy, double oz,
+    double nx, double ny, double nz,
+    double ux, double uy, double uz,
+    double vx, double vy, double vz,
+    double textHeight,
+    double embossDepth,
+    double deflection)
+{
+    auto failResult = []() {
+        emscripten::val r = emscripten::val::object();
+        r.set("projectedPoints", emscripten::val::array());
+        r.set("curvePoints", emscripten::val::array());
+        r.set("meshPositions", emscripten::val::global("Float32Array").new_(0));
+        r.set("meshNormals", emscripten::val::global("Float32Array").new_(0));
+        r.set("meshIndices", emscripten::val::global("Uint32Array").new_(0));
+        r.set("shapeHandle", -1);
+        return r;
+    };
+
+    const char* step = "init";
+    try {
+
+    // --- Validate mesh handle ---
+    if (meshHandle < 0 || meshHandle >= static_cast<int>(g_meshRegistry.size())) {
+        printf("  [occ] projectWithPreview: invalid meshHandle=%d\n", meshHandle);
+        return failResult();
+    }
+    RegisteredMeshData& mesh = g_meshRegistry[meshHandle];
+
+    // --- Placement frame ---
+    gp_Pnt origin(ox, oy, oz);
+    gp_Vec nAxis(nx, ny, nz);
+    gp_Vec uAxi(ux, uy, uz);
+    gp_Vec vAxi(vx, vy, vz);
+    {
+        double magN = nAxis.Magnitude();
+        double magU = uAxi.Magnitude();
+        double magV = vAxi.Magnitude();
+        if (magN < 1e-20 || magU < 1e-20 || magV < 1e-20) {
+            printf("  [occ] projectWithPreview: degenerate placement frame\n");
+            return failResult();
+        }
+        nAxis /= magN; uAxi /= magU; vAxi /= magV;
+    }
+
+    // --- Parse and sample contours ---
+    step = "parse contours";
+    std::vector<std::vector<gp_Pnt2d>> sampledContours;
+    int ok = parseAndSampleContours(contourData, deflection, sampledContours);
+    if (ok < 1) {
+        printf("  [occ] projectWithPreview: no valid contours\n");
+        return failResult();
+    }
+    printf("  [occ] projectWithPreview: %d contours sampled\n", ok);
+
+    // --- Project all contour points onto mesh ---
+    step = "ray cast contours";
+    std::vector<std::vector<gp_Pnt>> contour3DBottom;
+    std::vector<std::vector<gp_Vec>> contourNormals;
+    int totalPts = 0, missedPts = 0;
+
+    for (auto& pts2D : sampledContours) {
+        std::vector<gp_Pnt> pts3D;
+        std::vector<gp_Vec> norms;
+        for (auto& p2d : pts2D) {
+            totalPts++;
+            gp_Pnt src(origin.X() + p2d.X() * uAxi.X() + p2d.Y() * vAxi.X(),
+                       origin.Y() + p2d.X() * uAxi.Y() + p2d.Y() * vAxi.Y(),
+                       origin.Z() + p2d.X() * uAxi.Z() + p2d.Y() * vAxi.Z());
+
+            gp_Pnt rayOrigin = src.Translated(nAxis.Multiplied(100.0));
+            auto hit = castRayClosest(mesh, rayOrigin, -nAxis);
+
+            if (hit.valid) {
+                gp_Pnt hp; gp_Vec hn;
+                interpolateBarycentric(mesh, hit.triIndex, hit.u, hit.v, hp, hn);
+                pts3D.push_back(hp);
+                norms.push_back(hn);
+            } else {
+                missedPts++;
+                int bestTri = 0;
+                float bestU = 0, bestV = 0;
+                if (findClosestPoint(mesh, src, bestTri, bestU, bestV)) {
+                    gp_Pnt hp; gp_Vec hn;
+                    interpolateBarycentric(mesh, bestTri, bestU, bestV, hp, hn);
+                    pts3D.push_back(hp);
+                    norms.push_back(hn);
+                } else {
+                    pts3D.push_back(src);
+                    norms.push_back(nAxis);
+                }
+            }
+        }
+        if (pts3D.size() >= 2) {
+            contour3DBottom.push_back(pts3D);
+            contourNormals.push_back(norms);
+        }
+    }
+    printf("  [occ] projectWithPreview: %d/%d rays hit, %d contours\n",
+           totalPts - missedPts, totalPts, (int)contour3DBottom.size());
+
+    // --- Pack projectedPoints for return ---
+    emscripten::val projPtsArr = emscripten::val::array();
+    for (auto& pts : contour3DBottom) {
+        int len = (int)pts.size() * 3;
+        emscripten::val fa = emscripten::val::global("Float64Array").new_(len);
+        for (size_t i = 0; i < pts.size(); i++) {
+            fa.set(i * 3 + 0, pts[i].X());
+            fa.set(i * 3 + 1, pts[i].Y());
+            fa.set(i * 3 + 2, pts[i].Z());
+        }
+        projPtsArr.call<void>("push", fa);
+    }
+
+    // --- Classify outer vs hole contours ---
+    int outerIdx = 0;
+    double maxAbsArea = 0;
+    for (size_t ci = 0; ci < sampledContours.size(); ci++) {
+        double a = std::abs(signedAreaUV(sampledContours[ci]));
+        if (a > maxAbsArea) { maxAbsArea = a; outerIdx = (int)ci; }
+    }
+
+    // --- Fit BSpline surface ---
+    step = "fit surface";
+    gp_Vec avgNrm(0,0,0);
+    {
+        for (auto& norms : contourNormals)
+            for (auto& n : norms) avgNrm += n;
+        double nmag = avgNrm.Magnitude();
+        if (nmag < 1e-10) avgNrm = nAxis;
+        else avgNrm /= nmag;
+    }
+
+    Handle(Geom_BSplineSurface) fittedSurface;
+    {
+        std::vector<gp_Pnt> allBottomPts;
+        for (auto& pts : contour3DBottom)
+            allBottomPts.insert(allBottomPts.end(), pts.begin(), pts.end());
+        fittedSurface = fitMeshRegionSurface(allBottomPts, avgNrm);
+    }
+    if (fittedSurface.IsNull()) {
+        printf("  [occ] projectWithPreview: surface fitting failed\n");
+        emscripten::val r = emscripten::val::object();
+        r.set("projectedPoints", projPtsArr);
+        r.set("curvePoints", emscripten::val::array());
+        r.set("meshPositions", emscripten::val::global("Float32Array").new_(0));
+        r.set("meshNormals", emscripten::val::global("Float32Array").new_(0));
+        r.set("meshIndices", emscripten::val::global("Uint32Array").new_(0));
+        r.set("shapeHandle", -1);
+        return r;
+    }
+
+    // --- Build wires ---
+    step = "build wires";
+    printf("  [occ] projectWithPreview: building wires from %zu contours\n", contour3DBottom.size());
+    std::vector<TopoDS_Wire> bottomWires;
+    for (size_t ci = 0; ci < contour3DBottom.size(); ci++) {
+        auto& pts = contour3DBottom[ci];
+        size_t n = pts.size();
+        if (n < 2) continue;
+        printf("  [occ] wire[%zu]: %zu pts\n", ci, n);
+
+        bool alreadyClosed = (n >= 3 && pts[0].Distance(pts[n - 1]) < 1e-6);
+        size_t nLoop = alreadyClosed ? n - 1 : n;
+
+        BRepBuilderAPI_MakeWire wm;
+        int edgesAdded = 0;
+        for (size_t i = 0; i < nLoop; i++) {
+            size_t j = (i + 1) % nLoop;
+            if (pts[i].Distance(pts[j]) < 1e-6) continue;
+            try {
+                TopoDS_Edge e = BRepBuilderAPI_MakeEdge(
+                    BRepBuilderAPI_MakeVertex(pts[i]),
+                    BRepBuilderAPI_MakeVertex(pts[j]));
+                if (e.IsNull()) continue;
+                ShapeFix_Edge edgeFixer;
+                edgeFixer.FixAddPCurve(e, fittedSurface, TopLoc_Location(), Standard_False);
+                BRep_Builder bb;
+                bb.UpdateEdge(e, 0.5);
+                wm.Add(e);
+                edgesAdded++;
+            } catch (Standard_Failure& ex) {
+                printf("  [occ]   edge[%zu] exception: %s\n", i, ex.GetMessageString());
+            } catch (...) {
+                printf("  [occ]   edge[%zu] unknown exception\n", i);
+            }
+        }
+        printf("  [occ] wire[%zu]: %d edges, IsDone=%d\n", ci, edgesAdded, wm.IsDone() ? 1 : 0);
+        if (edgesAdded < 3 || !wm.IsDone()) continue;
+        TopoDS_Wire w = wm.Wire();
+        if (!w.IsNull()) {
+            w.Closed(Standard_True);
+            bottomWires.push_back(w);
+            printf("  [occ] wire[%zu]: OK\n", ci);
+        }
+    }
+    printf("  [occ] projectWithPreview: %zu wires, outerIdx=%d\n", bottomWires.size(), outerIdx);
+    if (bottomWires.empty() || outerIdx >= (int)bottomWires.size()) {
+        printf("  [occ] projectWithPreview: no valid wires\n");
+        emscripten::val r = emscripten::val::object();
+        r.set("projectedPoints", projPtsArr);
+        r.set("curvePoints", emscripten::val::array());
+        r.set("meshPositions", emscripten::val::global("Float32Array").new_(0));
+        r.set("meshNormals", emscripten::val::global("Float32Array").new_(0));
+        r.set("meshIndices", emscripten::val::global("Uint32Array").new_(0));
+        r.set("shapeHandle", -1);
+        return r;
+    }
+
+    // --- Sample curve points from wire edges ---
+    // Wire edges are line segments between projected points, so use contour points directly.
+    step = "sample curves";
+    printf("  [occ] projectWithPreview: packing curve points\n");
+    emscripten::val curvePtsArr = emscripten::val::array();
+    for (auto& pts : contour3DBottom) {
+        int len = (int)pts.size() * 3;
+        emscripten::val fa = emscripten::val::global("Float64Array").new_(len);
+        for (size_t i = 0; i < pts.size(); i++) {
+            fa.set(i * 3 + 0, pts[i].X());
+            fa.set(i * 3 + 1, pts[i].Y());
+            fa.set(i * 3 + 2, pts[i].Z());
+        }
+        curvePtsArr.call<void>("push", fa);
+    }
+
+    // --- Build face ---
+    step = "build face";
+    TopoDS_Face bottomFace;
+    {
+        try {
+            BRepBuilderAPI_MakeFace fb(fittedSurface, bottomWires[outerIdx], Standard_True);
+            if (fb.IsDone()) {
+                for (size_t i = 0; i < bottomWires.size(); i++) {
+                    if ((int)i == outerIdx) continue;
+                    try { fb.Add(bottomWires[i]); } catch (...) {}
+                }
+                bottomFace = fb.Face();
+            }
+        } catch (...) {}
+    }
+    if (bottomFace.IsNull()) {
+        printf("  [occ] projectWithPreview: face construction failed\n");
+        emscripten::val r = emscripten::val::object();
+        r.set("projectedPoints", projPtsArr);
+        r.set("curvePoints", curvePtsArr);
+        r.set("meshPositions", emscripten::val::global("Float32Array").new_(0));
+        r.set("meshNormals", emscripten::val::global("Float32Array").new_(0));
+        r.set("meshIndices", emscripten::val::global("Uint32Array").new_(0));
+        r.set("shapeHandle", -1);
+        return r;
+    }
+
+    // --- Fix and triangulate ---
+    step = "fix and mesh";
+    BRepLib::BuildCurves3d(bottomFace, 1e-5);
+    for (TopExp_Explorer eex(bottomFace, TopAbs_EDGE); eex.More(); eex.Next()) {
+        BRepLib::SameParameter(TopoDS::Edge(eex.Current()), 1e-5);
+    }
+    ShapeFix_Face fixer(bottomFace);
+    fixer.Perform();
+    bottomFace = TopoDS::Face(fixer.Face());
+
+    BRepMesh_IncrementalMesh mesher(bottomFace, deflection);
+    mesher.Perform();
+
+    // --- Extract triangulation ---
+    step = "extract mesh";
+    std::vector<float> positions;
+    std::vector<float> normals;
+    std::vector<unsigned int> indices;
+
+    TopLoc_Location loc;
+    Handle(Poly_Triangulation) tri = BRep_Tool::Triangulation(bottomFace, loc);
+    if (!tri.IsNull()) {
+        int nbNodes = tri->NbNodes();
+        int nbTris = tri->NbTriangles();
+        positions.reserve(nbNodes * 3);
+        normals.reserve(nbNodes * 3);
+        indices.reserve(nbTris * 3);
+
+        gp_Trsf trsf = loc.IsIdentity() ? gp_Trsf() : loc.Transformation();
+        bool hasTransform = !loc.IsIdentity();
+
+        for (int i = 1; i <= nbNodes; i++) {
+            gp_Pnt p = tri->Node(i);
+            if (hasTransform) p.Transform(trsf);
+            positions.push_back((float)p.X());
+            positions.push_back((float)p.Y());
+            positions.push_back((float)p.Z());
+        }
+
+        // Compute per-vertex normals from face surface
+        Handle(Geom_Surface) faceSurf = BRep_Tool::Surface(bottomFace);
+        for (int i = 1; i <= nbNodes; i++) {
+            gp_Pnt p = tri->Node(i);
+            if (hasTransform) p.Transform(trsf);
+            // Project point onto surface to get UV, then compute normal
+            if (!faceSurf.IsNull()) {
+                GeomAPI_ProjectPointOnSurf proj(p, faceSurf);
+                if (proj.NbPoints() > 0) {
+                    double u, v;
+                    proj.LowerDistanceParameters(u, v);
+                    gp_Pnt pSurf;
+                    gp_Vec d1u, d1v;
+                    faceSurf->D1(u, v, pSurf, d1u, d1v);
+                    gp_Vec n = d1u.Crossed(d1v);
+                    double mag = n.Magnitude();
+                    if (mag > 1e-10) n /= mag;
+                    else n = gp_Vec(avgNrm);
+                    normals.push_back((float)n.X());
+                    normals.push_back((float)n.Y());
+                    normals.push_back((float)n.Z());
+                } else {
+                    normals.push_back((float)avgNrm.X());
+                    normals.push_back((float)avgNrm.Y());
+                    normals.push_back((float)avgNrm.Z());
+                }
+            } else {
+                normals.push_back((float)avgNrm.X());
+                normals.push_back((float)avgNrm.Y());
+                normals.push_back((float)avgNrm.Z());
+            }
+        }
+
+        for (int i = 1; i <= nbTris; i++) {
+            int n1, n2, n3;
+            tri->Triangle(i).Get(n1, n2, n3);
+            indices.push_back((unsigned int)(n1 - 1));
+            indices.push_back((unsigned int)(n2 - 1));
+            indices.push_back((unsigned int)(n3 - 1));
+        }
+    }
+
+    // --- Register shape ---
+    int faceHandle = static_cast<int>(g_shapeRegistry.size());
+    g_shapeRegistry.push_back(bottomFace);
+    printf("  [occ] projectWithPreview: handle=%d, %zu verts, %zu tris\n",
+           faceHandle, positions.size() / 3, indices.size() / 3);
+
+    // --- Build return object ---
+    step = "pack result";
+    emscripten::val result = emscripten::val::object();
+    result.set("projectedPoints", projPtsArr);
+    result.set("curvePoints", curvePtsArr);
+
+    {
+        int len = (int)positions.size();
+        emscripten::val arr = emscripten::val::global("Float32Array").new_(len);
+        for (int i = 0; i < len; i++) arr.set(i, positions[i]);
+        result.set("meshPositions", arr);
+    }
+    {
+        int len = (int)normals.size();
+        emscripten::val arr = emscripten::val::global("Float32Array").new_(len);
+        for (int i = 0; i < len; i++) arr.set(i, normals[i]);
+        result.set("meshNormals", arr);
+    }
+    {
+        int len = (int)indices.size();
+        emscripten::val arr = emscripten::val::global("Uint32Array").new_(len);
+        for (int i = 0; i < len; i++) arr.set(i, indices[i]);
+        result.set("meshIndices", arr);
+    }
+    result.set("shapeHandle", faceHandle);
+    return result;
+
+    } catch (Standard_Failure& e) {
+        printf("  [occ] projectWithPreview [%s]: %s\n", step, e.GetMessageString());
+        return failResult();
+    } catch (...) {
+        printf("  [occ] projectWithPreview [%s]: unknown error\n", step);
+        return failResult();
+    }
+}

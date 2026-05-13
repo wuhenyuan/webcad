@@ -212,4 +212,6 @@ EMSCRIPTEN_BINDINGS(MeshProjectionBindings) {
     function("occProjectTextOnMesh",         &occProjectTextOnMesh);
     function("occGetMeshProjectionBottomFace", &occGetMeshProjectionBottomFace);
     function("occGetMeshProjectionTopFace",  &occGetMeshProjectionTopFace);
+    function("occBuildFaceFromPoints",       &occBuildFaceFromPoints);
+    function("occProjectTextOnMeshWithPreview", &occProjectTextOnMeshWithPreview);
 }

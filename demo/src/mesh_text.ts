@@ -5,9 +5,8 @@ import * as opentype from 'opentype.js';
 import {
   init as sdkInit,
   registerTriangleMesh, releaseMeshHandle,
-  projectTextOnMesh,
-  getMeshProjectionBottomFace, getMeshProjectionTopFace,
-  tessellateShape, releaseShapeHandle,
+  projectTextOnMeshWithPreview,
+  releaseShapeHandle,
 } from 'webcad-sdk';
 
 // ============================================================
@@ -207,94 +206,6 @@ function cleanupResults() {
   while (resultGroup.children.length > 0) resultGroup.remove(resultGroup.children[0]);
 }
 
-// Sample a Bezier segment into points (same logic as C++ GCPnts)
-function sampleBezier(segType: number, poles: [number, number][], numSamples: number): [number, number][] {
-  const pts: [number, number][] = [];
-  for (let si = 0; si <= numSamples; si++) {
-    const t = si / numSamples;
-    if (segType === 1) {
-      // Line: linear interpolate
-      pts.push([
-        poles[0][0] * (1 - t) + poles[1][0] * t,
-        poles[0][1] * (1 - t) + poles[1][1] * t,
-      ]);
-    } else if (segType === 2) {
-      // Quadratic Bezier
-      const u = 1 - t;
-      pts.push([
-        u * u * poles[0][0] + 2 * u * t * poles[1][0] + t * t * poles[2][0],
-        u * u * poles[0][1] + 2 * u * t * poles[1][1] + t * t * poles[2][1],
-      ]);
-    } else {
-      // Cubic Bezier
-      const u = 1 - t;
-      pts.push([
-        u * u * u * poles[0][0] + 3 * u * u * t * poles[1][0] + 3 * u * t * t * poles[2][0] + t * t * t * poles[3][0],
-        u * u * u * poles[0][1] + 3 * u * u * t * poles[1][1] + 3 * u * t * t * poles[2][1] + t * t * t * poles[3][1],
-      ]);
-    }
-  }
-  return pts;
-}
-
-// Draw projected text curves on the mesh surface (JS-side raycaster preview)
-function drawProjectedPreview(contours: Float64Array[], O: THREE.Vector3, U: THREE.Vector3, V: THREE.Vector3, N: THREE.Vector3) {
-  const group = new THREE.Group();
-  if (!dogMesh) return group;
-
-  const rc = new THREE.Raycaster();
-  const dotGeo = new THREE.SphereGeometry(0.05, 4, 4);
-  const dotMat = new THREE.MeshBasicMaterial({ color: 0xff4444 });
-  const curveMat = new THREE.LineBasicMaterial({ color: 0xff8844, linewidth: 1 });
-
-  for (const arr of contours) {
-    const nSeg = arr[0];
-    let off = 1;
-    const allProjPts: THREE.Vector3[] = [];
-
-    for (let si = 0; si < nSeg; si++) {
-      const segType = arr[off];
-      const npts = arr[off + 1];
-      const poles: [number, number][] = [];
-      for (let k = 0; k < npts; k++) {
-        poles.push([arr[off + 2 + k * 2], arr[off + 2 + k * 2 + 1]]);
-      }
-      off += 2 + npts * 2;
-
-      const samples = sampleBezier(segType, poles, 16);
-      const segPts: THREE.Vector3[] = [];
-      for (const [u, v] of samples) {
-        const src = O.clone().addScaledVector(U, u).addScaledVector(V, v);
-        // Ray cast from both directions
-        rc.set(src.clone().addScaledVector(N, 500), N.clone().negate());
-        let hits = rc.intersectObject(dogMesh, true);
-        if (hits.length === 0) {
-          rc.set(src.clone().addScaledVector(N, -500), N.clone());
-          hits = rc.intersectObject(dogMesh, true);
-        }
-        if (hits.length > 0) {
-          segPts.push(hits[0].point.clone());
-          // Draw dot
-          const dot = new THREE.Mesh(dotGeo, dotMat);
-          dot.position.copy(hits[0].point);
-          group.add(dot);
-        }
-      }
-      if (segPts.length >= 2) {
-        const geo = new THREE.BufferGeometry().setFromPoints(segPts);
-        group.add(new THREE.Line(geo, curveMat));
-      }
-      allProjPts.push(...segPts);
-    }
-    // Close contour if needed
-    if (allProjPts.length >= 2) {
-      const geo = new THREE.BufferGeometry().setFromPoints([allProjPts[allProjPts.length - 1], allProjPts[0]]);
-      group.add(new THREE.Line(geo, curveMat));
-    }
-  }
-  return group;
-}
-
 // Draw 2D contour curves on the tangent plane (visual debug)
 function drawContourPreview(contours: Float64Array[], O: THREE.Vector3, U: THREE.Vector3, V: THREE.Vector3) {
   const group = new THREE.Group();
@@ -338,9 +249,12 @@ function doProject() {
   console.log(`${'═'.repeat(60)}`);
   console.time('project');
 
-  // Draw preview of text outlines on tangent plane (yellow) and projected (red)
   const previewGroup = new THREE.Group();
   resultGroup.add(previewGroup);
+
+  const dotGeo = new THREE.SphereGeometry(0.3, 6, 6);
+  const dotMat = new THREE.MeshBasicMaterial({ color: 0xff4444 });
+  const curveMat = new THREE.LineBasicMaterial({ color: 0xff8844, linewidth: 1 });
 
   for (const ch of state.text) {
     const glyph = font.charToGlyph(ch);
@@ -349,13 +263,11 @@ function doProject() {
     const uvCurves = glyphToUVCurves(glyph, fontSize, 0, uvScale, 0, 0, cursorU, cursorV);
     if (uvCurves.length === 0) continue;
 
-    // Yellow = tangent plane outline; Red = projected onto mesh
+    // Yellow = tangent plane outline
     previewGroup.add(drawContourPreview(uvCurves, placement.point, placement.u, placement.v));
-    previewGroup.add(drawProjectedPreview(uvCurves, placement.point, placement.u, placement.v, placement.normal));
 
-    console.log(`  '${ch}': ${uvCurves.length} contours`);
-
-    const solidHandle = projectTextOnMesh(
+    // Unified C++ projection + face building
+    const result = projectTextOnMeshWithPreview(
       meshHandle, uvCurves,
       placement.point.x, placement.point.y, placement.point.z,
       placement.normal.x, placement.normal.y, placement.normal.z,
@@ -364,36 +276,52 @@ function doProject() {
       state.textHeight, state.embossDepth, state.deflection,
     );
 
-    if (solidHandle >= 0) {
-      resultShapeHandles.push(solidHandle);
-      console.log(`  Solid[${solidHandle}] '${ch}': OK`);
+    console.log(`  '${ch}': ${result.projectedPoints.length} contours, handle=${result.shapeHandle}`);
 
-      const sm = tessellateShape(solidHandle, state.deflection * 2);
-      console.log(`    mesh: ${sm.positions.length / 3} verts, ${sm.indices.length / 3} tris`);
-
-      if (sm.positions.length > 0) {
-        const geo = new THREE.BufferGeometry();
-        geo.setAttribute('position', new THREE.BufferAttribute(sm.positions, 3));
-        geo.setAttribute('normal', new THREE.BufferAttribute(sm.normals, 3));
-        geo.setIndex(new THREE.BufferAttribute(sm.indices, 1));
-        const mat = new THREE.MeshBasicMaterial({
-          color: 0xff8844,
-          side: THREE.DoubleSide,
-          depthTest: false,
-          transparent: true,
-          opacity: 0.8,
-        });
-        const mesh = new THREE.Mesh(geo, mat);
-        mesh.renderOrder = 999;
-        resultGroup.add(mesh);
-        // Wireframe
-        const wMat = new THREE.MeshBasicMaterial({ color: 0x221100, wireframe: true, depthTest: false });
-        const wMesh = new THREE.Mesh(geo, wMat);
-        wMesh.renderOrder = 1000;
-        resultGroup.add(wMesh);
+    // Draw projected points as red dots
+    for (const pts of result.projectedPoints) {
+      for (let i = 0; i < pts.length; i += 3) {
+        const dot = new THREE.Mesh(dotGeo, dotMat);
+        dot.position.set(pts[i], pts[i + 1], pts[i + 2]);
+        previewGroup.add(dot);
       }
-    } else {
-      console.log(`  Solid '${ch}': FAILED (${solidHandle})`);
+    }
+
+    // Draw curve samples as orange lines (actual OCCT Wire edges)
+    for (const pts of result.curvePoints) {
+      if (pts.length < 6) continue;
+      const positions = new Float32Array(pts.length);
+      for (let i = 0; i < pts.length; i++) positions[i] = pts[i];
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      previewGroup.add(new THREE.Line(geo, curveMat));
+    }
+
+    // Render face mesh from C++ triangulation
+    if (result.meshPositions.length > 0) {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(result.meshPositions, 3));
+      geo.setAttribute('normal', new THREE.BufferAttribute(result.meshNormals, 3));
+      geo.setIndex(new THREE.BufferAttribute(result.meshIndices, 1));
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0xff8844,
+        side: THREE.DoubleSide,
+        depthTest: false,
+        transparent: true,
+        opacity: 0.8,
+      });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.renderOrder = 999;
+      resultGroup.add(mesh);
+      const wMat = new THREE.MeshBasicMaterial({ color: 0x221100, wireframe: true, depthTest: false });
+      const wMesh = new THREE.Mesh(geo, wMat);
+      wMesh.renderOrder = 1000;
+      resultGroup.add(wMesh);
+      console.log(`    mesh: ${result.meshPositions.length / 3} verts, ${result.meshIndices.length / 3} tris`);
+    }
+
+    if (result.shapeHandle >= 0) {
+      resultShapeHandles.push(result.shapeHandle);
     }
 
     const adv = (glyph.advanceWidth ?? 0) / (font.unitsPerEm || 1000) * fontSize;

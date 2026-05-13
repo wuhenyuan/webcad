@@ -546,3 +546,66 @@ export function getMeshProjectionTopFace(): number {
   if (!_m) throw new Error('Not initialized.');
   return _m.occGetMeshProjectionTopFace();
 }
+
+// Build face from pre-computed 3D contour points (JS-side raycasting).
+// contourPoints: array of Float64Array, each is flat [x0,y0,z0, x1,y1,z1, ...]
+export function buildFaceFromPoints(
+  contourPoints: Float64Array[],
+  embossDepth: number,
+  deflection: number,
+): number {
+  if (!_m) throw new Error('Not initialized.');
+  return _m.occBuildFaceFromPoints(contourPoints, embossDepth, deflection);
+}
+
+export interface MeshTextProjectionResult {
+  projectedPoints: Float64Array[];
+  curvePoints: Float64Array[];
+  meshPositions: Float32Array;
+  meshNormals: Float32Array;
+  meshIndices: Uint32Array;
+  shapeHandle: number;
+}
+
+// Unified projection + preview: projects text contours onto mesh, builds face,
+// and returns all intermediate data for JS preview rendering.
+export function projectTextOnMeshWithPreview(
+  meshHandle: number,
+  contourData: Float64Array[],
+  ox: number, oy: number, oz: number,
+  nx: number, ny: number, nz: number,
+  ux: number, uy: number, uz: number,
+  vx: number, vy: number, vz: number,
+  textHeight: number,
+  embossDepth: number,
+  deflection: number,
+): MeshTextProjectionResult {
+  if (!_m) throw new Error('Not initialized.');
+  const raw = _m.occProjectTextOnMeshWithPreview(
+    meshHandle, contourData,
+    ox, oy, oz, nx, ny, nz,
+    ux, uy, uz, vx, vy, vz,
+    textHeight, embossDepth, deflection,
+  );
+
+  const projectedPoints: Float64Array[] = [];
+  const ppArr = raw.projectedPoints;
+  for (let i = 0; i < ppArr.length; i++) {
+    projectedPoints.push(ppArr[i]);
+  }
+
+  const curvePoints: Float64Array[] = [];
+  const cpArr = raw.curvePoints;
+  for (let i = 0; i < cpArr.length; i++) {
+    curvePoints.push(cpArr[i]);
+  }
+
+  return {
+    projectedPoints,
+    curvePoints,
+    meshPositions: raw.meshPositions,
+    meshNormals: raw.meshNormals,
+    meshIndices: raw.meshIndices,
+    shapeHandle: raw.shapeHandle,
+  };
+}

@@ -58,3 +58,31 @@ int occProjectTextOnMesh(
 // Retrieve handles for the bottom/top faces from the last projection.
 int occGetMeshProjectionBottomFace();
 int occGetMeshProjectionTopFace();
+
+// Build face from pre-computed 3D contour points (JS-side raycasting).
+// contourPoints: JS array of Float64Array, each is flat [x0,y0,z0, x1,y1,z1, ...]
+// embossDepth:   extrusion depth (for future solid construction)
+// deflection:    mesher deflection
+// Returns shape handle, or -1 on failure.
+int occBuildFaceFromPoints(emscripten::val contourPoints, double embossDepth, double deflection);
+
+// Unified projection + preview: projects text contours onto mesh, builds face,
+// and returns all intermediate data for JS preview rendering.
+//
+// Returns emscripten::val JS object:
+//   projectedPoints: Float64Array[] — per-contour projected 3D points (flat xyz)
+//   curvePoints:     Float64Array[] — per-wire edge samples (flat xyz)
+//   meshPositions:   Float32Array   — face triangulation positions
+//   meshNormals:     Float32Array   — face triangulation normals
+//   meshIndices:     Uint32Array    — face triangulation indices
+//   shapeHandle:     int            — face handle (-1 on failure)
+emscripten::val occProjectTextOnMeshWithPreview(
+    int meshHandle,
+    emscripten::val contourData,
+    double ox, double oy, double oz,
+    double nx, double ny, double nz,
+    double ux, double uy, double uz,
+    double vx, double vy, double vz,
+    double textHeight,
+    double embossDepth,
+    double deflection);
