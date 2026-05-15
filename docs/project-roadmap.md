@@ -231,3 +231,104 @@ glyph contours → 2D 采样点
 1. 顶点共享 (`VertexPool`) 贯穿全链路：底面 Wire → 顶面 Wire → 侧壁三角形，同一空间点对应同一个 `TopoDS_Vertex` 对象
 2. `sewTol` 锁定在 0.01，超过报错
 3. 缝合耗时从秒级降到毫秒级，Shell 错误彻底消失
+
+
+
+## 已完成：统一投影管线
+
+JS 端不再做独立投影，所有计算由 C++ 完成并返回中间数据（投影点、曲线采样、面网格）给 JS 预览。
+
+关键文件：
+- `core/occ_geometry_mesh.cpp` — `occProjectTextOnMeshWithPreview()`
+- `core/occ_geometry_mesh.h` — 函数声明
+- `bindings/bindings.cpp` — emscripten 注册
+- `web-sdk/src/index.ts` — `projectTextOnMeshWithPreview()` + `MeshTextProjectionResult`
+- `demo/src/mesh_text.ts` — `doProject()` 使用统一管线，移除了 JS 端 raycaster
+- `demo/vite.config.ts` — 排除 webcad-sdk 预构建（解决 Vite 缓存问题）
+
+## 当前问题
+
+### 问题 1：Mesher 三角化失败 (status=6, OpenWire) — ✅ 已解决
+
+**现象**：deflection=0.05 时，有孔字母（D、O）的三角化失败，返回 0 verts。
+
+**根因**：`ShapeFix_Face` 在处理 hole wire 时破坏了拓扑，导致 mesher 报 OpenWire。
+
+**最终解决方案**：
+1. **去掉 `ShapeFix_Face`** — 它是导致 status=6 的直接原因
+2. **根据 `signedAreaUV` 判断 hole wire 方向** — 如果 hole 和 outer 同向则反转
+3. **预创建共享顶点** — `BRepBuilderAPI_MakeVertex` 预先创建，边之间复用同一个 `TopoDS_Vertex`
+4. **`meshTol = max(deflection, 0.1)`** — 采样精度和 meshing 容差分离
+
+**已尝试但失败的方案**：
+1. `bb.UpdateEdge(e, 0.5)` 固定容差 — 0.05 时 O 失败
+2. `bb.UpdateEdge(e, deflection * 2)` — O 修好 D 又失败
+3. `bb.UpdateEdge(e, min(deflection, dist*0.1))` — 全成功但 20 秒
+4. `bb.UpdateEdge(e, deflection)` — 不稳定
+5. 放宽 `SameParameter` 到 `deflection * 3` — 无效
+6. UV-first (`Geom2d_Line` + `BRepBuilderAPI_MakeEdge(pcurve, surface)`) — 面不贴 mesh，畸形
+7. UV-first + 3D edge 混合 — mesher 卡死（3D 直线和 pcurve 曲线矛盾）
+
+### 问题 2：BSpline 曲面拟合振荡 — 未解决
+
+**现象**：面的边缘粗糙、G 字母有凸起/鼓包，面不紧贴原始 mesh。
+
+**根因详解**：
+
+`fitMeshRegionSurface` 的 grid 大小是动态计算的（`nu = nv = sqrt(N)`）：
+- D (82 pts) → 9x9 grid → 81 个控制点，但数据点全在轮廓边界
+- O (34 pts) → 5x5 grid → 效果好
+- G (73 pts) → 8x8 grid → 内部振荡
+
+问题本质：**所有拟合点都在轮廓边界上，grid 内部格点没有真实数据约束**。
+逆距离加权插值在远离数据点的区域只能"猜"，grid 越大猜的格点越多，BSpline 自由度越高，振荡越严重。
+
+类比：用钉子把弹性布的边缘钉住，中间没有钉子 → 布可以自由鼓起来。grid 9x9 = 弹性强（高阶），grid 5x5 = 布硬（低阶）。
+
+**解决方向**（按优先级）：
+1. **限制 grid 最大为 5x5 或 6x6** — 最简单，减少内部自由度
+2. **在轮廓内部添加约束点** — 从 mesh 上射线采样内部点参与拟合，让大 grid 也有约束
+3. **降低 BSpline 阶数** — 从 Deg=3 降到 Deg=2
+4. **对平坦区域用平面近似** — PCA ratio 很小时直接用平面
+
+### 问题 3：性能
+
+**现状**：deflection=0.05 时约 4 秒，deflection=0.15 时约 2 秒。
+
+**已优化**：
+- 法线计算从逐顶点 `GeomAPI_ProjectPointOnSurf`（12秒）改为三角面累加（瞬间）
+- 去掉 `ShapeFix_Face`（节省约 0.5 秒）
+
+**剩余瓶颈**：
+- BSpline 曲面拟合（PCA + grid interpolation + GeomAPI_PointsToBSplineSurface）
+- Wire/Face 构建
+- BRepMesh_IncrementalMesh 三角化
+
+## 已修复的 Bug
+
+1. **WASM 内存越界 (curve sampling)** — 从 Wire 边提取 3D curve 时 `BRep_Tool::Curve()` 返回 null 导致崩溃。修复：改为从 `bottomFace` 的 wire 提取（`BuildCurves3d` 之后）。
+
+2. **WASM 内存越界 (wire building)** — `BRepBuilderAPI_MakeWire::Wire()` 在没有成功添加边时被调用。修复：加 `edgesAdded < 3 || !wm.IsDone()` 保护。
+
+3. **Vite 缓存问题** — SDK 更新后 Vite 预构建缓存未刷新，导致 `projectTextOnMeshWithPreview` 找不到。修复：创建 `demo/vite.config.ts` 排除 webcad-sdk 预构建。
+
+4. **法线计算性能** — 逐顶点 `GeomAPI_ProjectPointOnSurf` 导致 12 秒。修复：改为从三角面直接累加法线。
+
+5. **ShapeFix_Face 破坏 hole wire 拓扑** — 导致 mesher status=6。修复：去掉 ShapeFix_Face。
+
+6. **Hole wire 方向错误** — 不反转时 hole 覆盖整个面（只剩 7 个三角形），盲目反转则内外颠倒。修复：根据 `signedAreaUV` 判断绕向，同向时才反转。
+
+## 关键发现
+
+- `BRepMesh_IncrementalMesh` status flags: 128=ReMesh（正常），6=OpenWire+Failure（致命），4=Failure（致命）
+- `ShapeFix_Face` 是 hole wire 三角化失败的元凶 — 去掉后全部成功
+- `FixAddPCurve` 在弯曲 BSpline 曲面上不可靠 — 产生的 pcurve 和 3D curve 偏差不可控
+- edge tolerance 必须 > pcurve 偏差，但 < 相邻顶点距离的一半，这个窗口在高精度时很窄
+- deflection 参数同时控制：Bezier 采样密度、edge tolerance、mesher 精度 — 需要用 `meshTol` 分离
+- 预创建共享顶点不能解决 status=6（问题在 ShapeFix 不在顶点共享）
+- pcurve-only 方案（`BRepBuilderAPI_MakeEdge(pcurve, surface)`）面不贴原始 mesh — 因为面在 BSpline 曲面上而非 mesh 上
+- BSpline grid 大小动态计算 `sqrt(N)` 导致大轮廓（D=9x9, G=8x8）内部振荡
+
+**Why:** 记录尝试过的路线避免重复踩坑，下次对话可以直接从当前进度继续。
+
+**How to apply:** 解决问题 1 时参考已尝试方案，不要重复走失败路线。当前正在测试 UV-first 方案。

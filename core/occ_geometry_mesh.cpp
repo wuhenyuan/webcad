@@ -801,7 +801,7 @@ static Handle(Geom_BSplineSurface) fitMeshRegionSurface(
     }
 
     // --- Step 7: Build regular grid from scattered UV points ---
-    int gridRes = std::max(5, std::min(25, (int)std::sqrt((double)pts.size())));
+    int gridRes = std::max(5, std::min(6, (int)std::sqrt((double)pts.size())));
     int nu = gridRes, nv = gridRes;
 
     TColgp_Array2OfPnt grid(1, nu, 1, nv);
@@ -1233,7 +1233,7 @@ int occProjectTextOnMesh(
 
                 // Set edge tolerance to accommodate 3D-vs-pcurve deviation
                 BRep_Builder bb;
-                bb.UpdateEdge(e, 0.5);
+                bb.UpdateEdge(e, deflection);
 
                 if (!e.IsNull()) { wm.Add(e); edgesAdded++; }
             } catch (...) {}
@@ -1474,7 +1474,7 @@ int occBuildFaceFromPoints(emscripten::val contourPoints, double embossDepth, do
                 ShapeFix_Edge edgeFixer;
                 edgeFixer.FixAddPCurve(e, fittedSurface, TopLoc_Location(), Standard_False);
                 BRep_Builder bb;
-                bb.UpdateEdge(e, 0.5);
+                bb.UpdateEdge(e, deflection);
                 wm.Add(e); edgesAdded++;
             } catch (...) {}
         }
@@ -1691,14 +1691,26 @@ emscripten::val occProjectTextOnMeshWithPreview(
     step = "build wires";
     printf("  [occ] projectWithPreview: building wires from %zu contours\n", contour3DBottom.size());
     std::vector<TopoDS_Wire> bottomWires;
+
+    // Use a meshing tolerance that's independent of sampling deflection
+    // This avoids the pcurve deviation vs tolerance conflict
+    double meshTol = std::max(deflection, 0.1);
+
     for (size_t ci = 0; ci < contour3DBottom.size(); ci++) {
         auto& pts = contour3DBottom[ci];
         size_t n = pts.size();
-        if (n < 2) continue;
+        if (n < 3) continue;
         printf("  [occ] wire[%zu]: %zu pts\n", ci, n);
 
         bool alreadyClosed = (n >= 3 && pts[0].Distance(pts[n - 1]) < 1e-6);
         size_t nLoop = alreadyClosed ? n - 1 : n;
+
+        // Pre-create vertices so they are topologically shared between edges
+        std::vector<TopoDS_Vertex> verts;
+        verts.reserve(nLoop);
+        for (size_t i = 0; i < nLoop; i++) {
+            verts.push_back(BRepBuilderAPI_MakeVertex(pts[i]));
+        }
 
         BRepBuilderAPI_MakeWire wm;
         int edgesAdded = 0;
@@ -1706,14 +1718,12 @@ emscripten::val occProjectTextOnMeshWithPreview(
             size_t j = (i + 1) % nLoop;
             if (pts[i].Distance(pts[j]) < 1e-6) continue;
             try {
-                TopoDS_Edge e = BRepBuilderAPI_MakeEdge(
-                    BRepBuilderAPI_MakeVertex(pts[i]),
-                    BRepBuilderAPI_MakeVertex(pts[j]));
+                TopoDS_Edge e = BRepBuilderAPI_MakeEdge(verts[i], verts[j]);
                 if (e.IsNull()) continue;
                 ShapeFix_Edge edgeFixer;
                 edgeFixer.FixAddPCurve(e, fittedSurface, TopLoc_Location(), Standard_False);
                 BRep_Builder bb;
-                bb.UpdateEdge(e, 0.5);
+                bb.UpdateEdge(e, meshTol);
                 wm.Add(e);
                 edgesAdded++;
             } catch (Standard_Failure& ex) {
@@ -1745,35 +1755,46 @@ emscripten::val occProjectTextOnMeshWithPreview(
     }
 
     // --- Sample curve points from wire edges ---
-    // Wire edges are line segments between projected points, so use contour points directly.
+    // Placeholder — real curves extracted after BuildCurves3d below
     step = "sample curves";
-    printf("  [occ] projectWithPreview: packing curve points\n");
+    printf("  [occ] projectWithPreview: packing curve points (placeholder)\n");
     emscripten::val curvePtsArr = emscripten::val::array();
-    for (auto& pts : contour3DBottom) {
-        int len = (int)pts.size() * 3;
-        emscripten::val fa = emscripten::val::global("Float64Array").new_(len);
-        for (size_t i = 0; i < pts.size(); i++) {
-            fa.set(i * 3 + 0, pts[i].X());
-            fa.set(i * 3 + 1, pts[i].Y());
-            fa.set(i * 3 + 2, pts[i].Z());
-        }
-        curvePtsArr.call<void>("push", fa);
-    }
 
     // --- Build face ---
     step = "build face";
+    printf("  [occ] projectWithPreview: building face, outerIdx=%d, %zu wires\n", outerIdx, bottomWires.size());
     TopoDS_Face bottomFace;
     {
         try {
             BRepBuilderAPI_MakeFace fb(fittedSurface, bottomWires[outerIdx], Standard_True);
+            printf("  [occ]   MakeFace outer: IsDone=%d, Error=%d\n", fb.IsDone() ? 1 : 0, (int)fb.Error());
             if (fb.IsDone()) {
+                // Determine outer wire winding direction
+                double outerArea = signedAreaUV(sampledContours[outerIdx]);
                 for (size_t i = 0; i < bottomWires.size(); i++) {
                     if ((int)i == outerIdx) continue;
-                    try { fb.Add(bottomWires[i]); } catch (...) {}
+                    try {
+                        // Reverse hole wire only if it has same winding as outer
+                        double holeArea = signedAreaUV(sampledContours[i]);
+                        bool sameWinding = (outerArea > 0 && holeArea > 0) || (outerArea < 0 && holeArea < 0);
+                        TopoDS_Wire holeWire = sameWinding
+                            ? TopoDS::Wire(bottomWires[i].Reversed())
+                            : bottomWires[i];
+                        fb.Add(holeWire);
+                        printf("  [occ]   Add hole[%zu]: Error=%d, reversed=%d\n", i, (int)fb.Error(), sameWinding ? 1 : 0);
+                    } catch (Standard_Failure& ex) {
+                        printf("  [occ]   Add hole[%zu] exception: %s\n", i, ex.GetMessageString());
+                    } catch (...) {
+                        printf("  [occ]   Add hole[%zu] unknown exception\n", i);
+                    }
                 }
                 bottomFace = fb.Face();
             }
-        } catch (...) {}
+        } catch (Standard_Failure& ex) {
+            printf("  [occ]   MakeFace exception: %s\n", ex.GetMessageString());
+        } catch (...) {
+            printf("  [occ]   MakeFace unknown exception\n");
+        }
     }
     if (bottomFace.IsNull()) {
         printf("  [occ] projectWithPreview: face construction failed\n");
@@ -1786,19 +1807,50 @@ emscripten::val occProjectTextOnMeshWithPreview(
         r.set("shapeHandle", -1);
         return r;
     }
+    printf("  [occ] projectWithPreview: face built OK\n");
 
     // --- Fix and triangulate ---
     step = "fix and mesh";
-    BRepLib::BuildCurves3d(bottomFace, 1e-5);
+    printf("  [occ] projectWithPreview: fixing face...\n");
+    BRepLib::BuildCurves3d(bottomFace, meshTol);
     for (TopExp_Explorer eex(bottomFace, TopAbs_EDGE); eex.More(); eex.Next()) {
-        BRepLib::SameParameter(TopoDS::Edge(eex.Current()), 1e-5);
+        BRepLib::SameParameter(TopoDS::Edge(eex.Current()), meshTol);
     }
-    ShapeFix_Face fixer(bottomFace);
-    fixer.Perform();
-    bottomFace = TopoDS::Face(fixer.Face());
+    // Skip ShapeFix — it may corrupt hole wire topology
+    printf("  [occ] projectWithPreview: face fixed, meshing...\n");
+
+    // --- Extract real 3D curves from face edges (after BuildCurves3d) ---
+    step = "extract curves";
+    curvePtsArr = emscripten::val::array();
+    for (TopExp_Explorer wex(bottomFace, TopAbs_WIRE); wex.More(); wex.Next()) {
+        TopoDS_Wire wire = TopoDS::Wire(wex.Current());
+        std::vector<double> samples;
+        for (TopExp_Explorer ex(wire, TopAbs_EDGE); ex.More(); ex.Next()) {
+            TopoDS_Edge edge = TopoDS::Edge(ex.Current());
+            double first, last;
+            Handle(Geom_Curve) curve3d = BRep_Tool::Curve(edge, first, last);
+            if (curve3d.IsNull()) continue;
+            int nSamples = 4;
+            for (int k = 0; k <= nSamples; k++) {
+                double t = first + (last - first) * k / nSamples;
+                gp_Pnt p = curve3d->Value(t);
+                samples.push_back(p.X());
+                samples.push_back(p.Y());
+                samples.push_back(p.Z());
+            }
+        }
+        if (!samples.empty()) {
+            int len = (int)samples.size();
+            emscripten::val fa = emscripten::val::global("Float64Array").new_(len);
+            for (int i = 0; i < len; i++) fa.set(i, samples[i]);
+            curvePtsArr.call<void>("push", fa);
+        }
+    }
+    printf("  [occ] projectWithPreview: %d curve arrays extracted\n", curvePtsArr["length"].as<int>());
 
     BRepMesh_IncrementalMesh mesher(bottomFace, deflection);
     mesher.Perform();
+    printf("  [occ] projectWithPreview: mesher status=%d\n", mesher.GetStatusFlags());
 
     // --- Extract triangulation ---
     step = "extract mesh";
@@ -1826,37 +1878,30 @@ emscripten::val occProjectTextOnMeshWithPreview(
             positions.push_back((float)p.Z());
         }
 
-        // Compute per-vertex normals from face surface
-        Handle(Geom_Surface) faceSurf = BRep_Tool::Surface(bottomFace);
-        for (int i = 1; i <= nbNodes; i++) {
-            gp_Pnt p = tri->Node(i);
-            if (hasTransform) p.Transform(trsf);
-            // Project point onto surface to get UV, then compute normal
-            if (!faceSurf.IsNull()) {
-                GeomAPI_ProjectPointOnSurf proj(p, faceSurf);
-                if (proj.NbPoints() > 0) {
-                    double u, v;
-                    proj.LowerDistanceParameters(u, v);
-                    gp_Pnt pSurf;
-                    gp_Vec d1u, d1v;
-                    faceSurf->D1(u, v, pSurf, d1u, d1v);
-                    gp_Vec n = d1u.Crossed(d1v);
-                    double mag = n.Magnitude();
-                    if (mag > 1e-10) n /= mag;
-                    else n = gp_Vec(avgNrm);
-                    normals.push_back((float)n.X());
-                    normals.push_back((float)n.Y());
-                    normals.push_back((float)n.Z());
-                } else {
-                    normals.push_back((float)avgNrm.X());
-                    normals.push_back((float)avgNrm.Y());
-                    normals.push_back((float)avgNrm.Z());
-                }
-            } else {
-                normals.push_back((float)avgNrm.X());
-                normals.push_back((float)avgNrm.Y());
-                normals.push_back((float)avgNrm.Z());
+        // Compute per-vertex normals from triangle faces (angle-weighted)
+        normals.resize(nbNodes * 3, 0.0f);
+        for (int i = 1; i <= nbTris; i++) {
+            int n1, n2, n3;
+            tri->Triangle(i).Get(n1, n2, n3);
+            gp_Pnt p1 = tri->Node(n1), p2 = tri->Node(n2), p3 = tri->Node(n3);
+            if (hasTransform) { p1.Transform(trsf); p2.Transform(trsf); p3.Transform(trsf); }
+            gp_Vec v1(p1, p2), v2(p1, p3);
+            gp_Vec fn = v1.Crossed(v2);
+            double mag = fn.Magnitude();
+            if (mag < 1e-10) continue;
+            fn /= mag;
+            int idx[3] = { (n1-1)*3, (n2-1)*3, (n3-1)*3 };
+            for (int k = 0; k < 3; k++) {
+                normals[idx[k]+0] += (float)fn.X();
+                normals[idx[k]+1] += (float)fn.Y();
+                normals[idx[k]+2] += (float)fn.Z();
             }
+        }
+        for (int i = 0; i < nbNodes; i++) {
+            float nx = normals[i*3], ny = normals[i*3+1], nz = normals[i*3+2];
+            float len = std::sqrt(nx*nx + ny*ny + nz*nz);
+            if (len > 1e-10f) { normals[i*3] /= len; normals[i*3+1] /= len; normals[i*3+2] /= len; }
+            else { normals[i*3] = (float)avgNrm.X(); normals[i*3+1] = (float)avgNrm.Y(); normals[i*3+2] = (float)avgNrm.Z(); }
         }
 
         for (int i = 1; i <= nbTris; i++) {

@@ -195,6 +195,9 @@ const state = {
   embossDepth: 2,
   deflection: 0.15,
   xRot: -90,
+  showFace: true,
+  showContour: true,
+  showCurves: true,
 };
 
 // Placement data (set by mouse click on mesh)
@@ -252,9 +255,9 @@ function doProject() {
   const previewGroup = new THREE.Group();
   resultGroup.add(previewGroup);
 
-  const dotGeo = new THREE.SphereGeometry(0.3, 6, 6);
+  const dotGeo = new THREE.SphereGeometry(0.05, 6, 6);
   const dotMat = new THREE.MeshBasicMaterial({ color: 0xff4444 });
-  const curveMat = new THREE.LineBasicMaterial({ color: 0xff8844, linewidth: 1 });
+  const curveMat = new THREE.LineBasicMaterial({ color: 0x00aa44, linewidth: 2, depthTest: false });
 
   for (const ch of state.text) {
     const glyph = font.charToGlyph(ch);
@@ -264,7 +267,9 @@ function doProject() {
     if (uvCurves.length === 0) continue;
 
     // Yellow = tangent plane outline
-    previewGroup.add(drawContourPreview(uvCurves, placement.point, placement.u, placement.v));
+    if (state.showContour) {
+      previewGroup.add(drawContourPreview(uvCurves, placement.point, placement.u, placement.v));
+    }
 
     // Unified C++ projection + face building
     const result = projectTextOnMeshWithPreview(
@@ -287,18 +292,25 @@ function doProject() {
       }
     }
 
-    // Draw curve samples as orange lines (actual OCCT Wire edges)
-    for (const pts of result.curvePoints) {
-      if (pts.length < 6) continue;
-      const positions = new Float32Array(pts.length);
-      for (let i = 0; i < pts.length; i++) positions[i] = pts[i];
-      const geo = new THREE.BufferGeometry();
-      geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-      previewGroup.add(new THREE.Line(geo, curveMat));
+    // Draw curve samples as green tubes (actual OCCT Wire edges)
+    if (state.showCurves) {
+      const tubeMat = new THREE.MeshBasicMaterial({ color: 0x00aa44, depthTest: false });
+      for (const pts of result.curvePoints) {
+        if (pts.length < 6) continue;
+        const points: THREE.Vector3[] = [];
+        for (let i = 0; i < pts.length; i += 3) {
+          points.push(new THREE.Vector3(pts[i], pts[i + 1], pts[i + 2]));
+        }
+        const curve = new THREE.CatmullRomCurve3(points, false);
+        const tubeGeo = new THREE.TubeGeometry(curve, points.length * 4, 0.08, 4, false);
+        const tubeMesh = new THREE.Mesh(tubeGeo, tubeMat);
+        tubeMesh.renderOrder = 998;
+        previewGroup.add(tubeMesh);
+      }
     }
 
     // Render face mesh from C++ triangulation
-    if (result.meshPositions.length > 0) {
+    if (result.meshPositions.length > 0 && state.showFace) {
       const geo = new THREE.BufferGeometry();
       geo.setAttribute('position', new THREE.BufferAttribute(result.meshPositions, 3));
       geo.setAttribute('normal', new THREE.BufferAttribute(result.meshNormals, 3));
@@ -440,6 +452,39 @@ function createPanel() {
   slider('text height', 'textHeight', 1, 30, 0.5);
   slider('emboss depth', 'embossDepth', 0.3, 6, 0.1);
   slider('deflection', 'deflection', 0.05, 2, 0.05);
+
+  // Show face toggle
+  const faceRow = document.createElement('div');
+  faceRow.style.cssText = 'margin-bottom:8px; display:flex; align-items:center; gap:6px;';
+  const faceCb = document.createElement('input');
+  faceCb.type = 'checkbox'; faceCb.checked = state.showFace;
+  faceCb.style.cssText = 'cursor:pointer;';
+  faceCb.addEventListener('change', () => { state.showFace = faceCb.checked; if (placement) doProject(); });
+  const faceLbl = document.createElement('span'); faceLbl.textContent = 'show face'; faceLbl.style.cssText = 'color:#aaa;';
+  faceRow.appendChild(faceCb); faceRow.appendChild(faceLbl);
+  div.appendChild(faceRow);
+
+  // Show contour toggle
+  const contourRow = document.createElement('div');
+  contourRow.style.cssText = 'margin-bottom:8px; display:flex; align-items:center; gap:6px;';
+  const contourCb = document.createElement('input');
+  contourCb.type = 'checkbox'; contourCb.checked = state.showContour;
+  contourCb.style.cssText = 'cursor:pointer;';
+  contourCb.addEventListener('change', () => { state.showContour = contourCb.checked; if (placement) doProject(); });
+  const contourLbl = document.createElement('span'); contourLbl.textContent = 'show contour'; contourLbl.style.cssText = 'color:#aaa;';
+  contourRow.appendChild(contourCb); contourRow.appendChild(contourLbl);
+  div.appendChild(contourRow);
+
+  // Show curves toggle
+  const curvesRow = document.createElement('div');
+  curvesRow.style.cssText = 'margin-bottom:8px; display:flex; align-items:center; gap:6px;';
+  const curvesCb = document.createElement('input');
+  curvesCb.type = 'checkbox'; curvesCb.checked = state.showCurves;
+  curvesCb.style.cssText = 'cursor:pointer;';
+  curvesCb.addEventListener('change', () => { state.showCurves = curvesCb.checked; if (placement) doProject(); });
+  const curvesLbl = document.createElement('span'); curvesLbl.textContent = 'show curves'; curvesLbl.style.cssText = 'color:#aaa;';
+  curvesRow.appendChild(curvesCb); curvesRow.appendChild(curvesLbl);
+  div.appendChild(curvesRow);
 
   // Presets
   function btn(label: string, t: string, th: number, ed: number) {
